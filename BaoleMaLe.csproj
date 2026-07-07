@@ -3,11 +3,11 @@
   <!-- Project settings -->
   <PropertyGroup>
     <Name>BaoleMaLe</Name>
-    <Version>0.1.0.0</Version>
+    <Version>0.2.0.0</Version>
     <Author>斯温</Author>
     <RepoUrl>https://github.com/qliczz/BaoleMaLe</RepoUrl>
-    <Punchline>统计你打出的伤害技能的直暴运气</Punchline>
-    <Description>统计玩家释放/命中/直击/暴击/直暴次数与几率，并用 FFLogs 风格配色评价直暴运气。</Description>
+    <Punchline>Is that a crit？</Punchline>
+    <Description>统计玩家打出的伤害技能的直暴运气，按角色面板理论几率评分，并自动分段记录每场战斗、分职业统计。</Description>
     <LoadRequiredState>1</LoadRequiredState>
     <CanUnloadAsync>true</CanUnloadAsync>
   </PropertyGroup>
