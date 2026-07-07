@@ -10,6 +10,7 @@ public class Plugin : IDalamudPlugin
     private readonly IDataManager dataManager;
     private readonly IPluginLog log;
     private readonly IFramework framework;
+    private readonly IClientState clientState;
 
     private readonly Configuration config;
     private readonly CombatTracker tracker;
@@ -24,16 +25,19 @@ public class Plugin : IDalamudPlugin
         IObjectTable objects,
         IDataManager dataManager,
         IPluginLog log,
-        IFramework framework)
+        IFramework framework,
+        IClientState clientState)
     {
         this.pluginInterface = pluginInterface;
         this.commandManager = commandManager;
         this.dataManager = dataManager;
         this.log = log;
         this.framework = framework;
+        this.clientState = clientState;
 
         DalamudApi.ObjectTable = objects;
         DalamudApi.DataManager = dataManager;
+        DalamudApi.ClientState = clientState;
 
         this.config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
