@@ -10,4 +10,5 @@ public static class DalamudApi
 {
     public static IObjectTable? ObjectTable;
     public static IDataManager? DataManager;
+    public static IClientState? ClientState;
 }
