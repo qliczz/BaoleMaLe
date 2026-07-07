@@ -1,0 +1,14 @@
+{
+  "Name": "爆了吗？",
+  "InternalName": "BaoleMaLe",
+  "AssemblyVersion": "0.1.0.0",
+  "TestingAssemblyVersion": "0.1.0.0",
+  "DalamudApiLevel": 15,
+  "Author": "斯温",
+  "Description": "统计玩家打出的伤害技能，并给出 FFLogs 风格直暴运气评分。",
+  "RepoUrl": "https://github.com/qliczz/BaoleMaLe",
+  "DownloadLinkInstall": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
+  "DownloadLinkUpdate": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
+  "DownloadLinkTesting": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
+  "Changelog": "初始版本。"
+}
