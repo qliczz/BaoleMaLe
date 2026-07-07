@@ -2,15 +2,19 @@ namespace BaoleMaLe;
 
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using GameObjectId = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectId;
+using Dalamud.Plugin.Services;
+using Newtonsoft.Json;
+using System.IO;
+using Lumina.Excel.Sheets;
 
 /// <summary>
-/// 单个动作（技能）的累计统计。所有计数线程安全（由 CombatTracker 的锁保护）。
+/// 单个技能（动作）的累计统计。
 /// </summary>
 public sealed class SkillStat
 {
     public uint ActionId;
 
-    /// <summary>释放次数：本地玩家施放该伤害技能的次数（一次 Receive 调用计 1 次，多段/AoE 也只算 1 次释放）。</summary>
+    /// <summary>释放次数：本地玩家施放该伤害技能的次数（一次 Receive 调用计 1 次）。</summary>
     public long Casts;
 
     /// <summary>命中次数：造成实际伤害(Effect.Type==0x03)的效果条目数（多段/AoE 会 &gt; 释放次数）。</summary>
@@ -25,49 +29,74 @@ public sealed class SkillStat
     /// <summary>直暴（暴击且直击）次数。</summary>
     public long CritDirect;
 
+    [JsonIgnore]
     public double CritRate => Hits > 0 ? (double)Crit / Hits : 0;
+    [JsonIgnore]
     public double DirectHitRate => Hits > 0 ? (double)DirectHit / Hits : 0;
+    [JsonIgnore]
     public double CritDirectRate => Hits > 0 ? (double)CritDirect / Hits : 0;
 }
 
 /// <summary>
-/// 战斗统计核心：钩住 <see cref="ActionEffectHandler.Receive"/>（FFXIV 7.x / Dawntrail 的战斗效果入口），
-/// 捕获本地玩家打出的每一个伤害技能，逐条累计 释放/命中/暴击/直击/直暴 次数。
+/// 一场已结束（或正在进行）的战斗记录，可序列化落盘，构成"数据浏览库"。
+/// </summary>
+public sealed class BattleRecord
+{
+    public string Id = "";
+    public long StartedUnix;
+    public long EndedUnix;
+    public byte JobId;
+    public string JobName = "";
+    /// <summary>开场时从角色面板读取的理论暴击率（%，0–100）。</summary>
+    public double CritRatePct;
+    /// <summary>开场时从角色面板读取的理论直击率（%，0–100）。</summary>
+    public double DhRatePct;
+    public Dictionary<uint, SkillStat> Skills = new();
+    /// <summary>整场战斗的直暴运气评分（0–100），结束时计算并缓存。</summary>
+    public double? BattleLuck;
+}
+
+/// <summary>
+/// 战斗统计核心：
+///  - 钩住 ActionEffectHandler.Receive（7.x 战斗效果入口）采集本地玩家的伤害技能数据；
+///  - 监听 Character.InCombat 自动把数据分段成"一场场战斗"；
+///  - 同时维护 总计数（全职业累计）、分职业计数、以及最近 N 场战斗的历史库（落盘）。
 ///
-/// 7.x 效果条目编码（参见 ACT_Tech_Guide 7.0）：
-///   每条 Effect 8 字节：[Type][Param0]…[Value]
-///   - Type == 0x03 表示"造成伤害"（一次命中）
-///   - Param0 为严重度：0x20=暴击，0x40=直击，0x60=暴击+直击（普通为 0）
+/// 7.x 效果编码：每条 Effect 8 字节，Type==0x03 为伤害，Param0 严重度 0x20=暴击 / 0x40=直击 / 0x60=直暴。
 /// </summary>
 public unsafe class CombatTracker : IDisposable
 {
-    // ActionEffectHandler.Receive 的签名（FFXIVClientStructs 7.x / Dawntrail 文档签名）。
-    // 每个大版本可能变动；失效时请更新此签名（插件会优雅降级并在日志提示）。
     private const string ReceiveSig =
         "E8 ?? ?? ?? ?? 48 8B 8D ?? ?? ?? ?? 48 33 CC E8 ?? ?? ?? ?? 48 81 C4 00 05 00 00";
 
-    // 效果条目里"造成伤害"的 Type 值，以及严重度位。
     private const byte TypeDamage = 0x03;
     private const byte SeverityCrit = 0x20;
     private const byte SeverityDirect = 0x40;
 
+    // 连续脱战超过该秒数，判定当前战斗结束。
+    private const int CombatGraceSeconds = 8;
+
     private readonly IGameInteropProvider interop;
     private readonly ISigScanner sigScanner;
     private readonly IObjectTable objects;
+    private readonly IDataManager dataManager;
     private readonly IPluginLog log;
-
-    private readonly Dictionary<uint, SkillStat> stats = new();
-    private readonly object lockObj = new();
+    private readonly string configDir;
+    private int maxBattles;
 
     private Hook<ReceiveDelegate>? hook;
+    private readonly object lockObj = new();
 
-    // 诊断计数：前若干次回调记录到日志，便于确认钩子是否生效、来源过滤是否正确。
+    private Dictionary<uint, SkillStat> grandTotals = new();
+    private Dictionary<byte, Dictionary<uint, SkillStat>> jobTotals = new();
+    private List<BattleRecord> history = new();
+
+    private BattleRecord? current;
+    private DateTime lastCombatTime = DateTime.MinValue;
     private int diagCount;
-    private bool firstLocalDetailLogged;
 
     public bool IsTrackingEnabled { get; set; } = true;
 
-    // 与 ActionEffectHandler.Receive 完全一致的委托签名。
     private unsafe delegate void ReceiveDelegate(
         uint casterEntityId,
         Character* casterPtr,
@@ -76,17 +105,19 @@ public unsafe class CombatTracker : IDisposable
         ActionEffectHandler.TargetEffects* effects,
         GameObjectId* targetEntityIds);
 
-
     public CombatTracker(IGameInteropProvider interop, ISigScanner sigScanner,
-        IObjectTable objects, IPluginLog log)
+        IObjectTable objects, IDataManager dataManager, IPluginLog log, string configDir, int maxBattles)
     {
         this.interop = interop;
         this.sigScanner = sigScanner;
         this.objects = objects;
+        this.dataManager = dataManager;
         this.log = log;
+        this.configDir = configDir;
+        this.maxBattles = Math.Max(1, maxBattles);
+        LoadAll();
     }
 
-    /// <summary>尝试安装钩子；失败（签名不匹配）时优雅降级，统计停用。</summary>
     public void Enable()
     {
         try
@@ -94,47 +125,83 @@ public unsafe class CombatTracker : IDisposable
             var addr = this.sigScanner.ScanText(ReceiveSig);
             this.hook = this.interop.HookFromAddress<ReceiveDelegate>(addr, Detour);
             this.hook.Enable();
-            this.log.Info("[爆了吗？] ActionEffectHandler.Receive 钩子已启用。");
+            this.log.Info("[Is that a crit？] ActionEffectHandler.Receive 钩子已启用。");
         }
         catch (Exception ex)
         {
             this.hook = null;
-            this.log.Error(ex, "[爆了吗？] 无法安装 Receive 钩子，伤害统计将不可用（可能是游戏版本更新导致签名失效，请更新 ReceiveSig）。");
+            this.log.Error(ex, "[Is that a crit？] 无法安装 Receive 钩子，伤害统计将不可用（可能是游戏版本更新导致签名失效，请更新 ReceiveSig）。");
         }
     }
 
     public void Dispose()
     {
+        EndSession();
         this.hook?.Disable();
         this.hook?.Dispose();
         this.hook = null;
     }
 
-    /// <summary>清空所有统计。</summary>
-    public void Reset()
+    /// <summary>每帧由 Plugin 的 Framework tick 调用，负责自动开/关战斗分段。</summary>
+    public void Tick()
     {
-        lock (this.lockObj)
-            this.stats.Clear();
+        bool inCombat;
+        try { inCombat = PlayerStats.IsLocalPlayerInCombat(); }
+        catch { inCombat = false; }
+
+        if (inCombat)
+            this.lastCombatTime = DateTime.Now;
+
+        if (!this.IsTrackingEnabled)
+        {
+            if (this.current != null)
+                EndSession();
+            return;
+        }
+
+        if (inCombat && this.current == null)
+            StartSession();
+        else if (!inCombat && this.current != null &&
+                 (DateTime.Now - this.lastCombatTime).TotalSeconds > CombatGraceSeconds)
+            EndSession();
     }
 
-    /// <summary>快照当前统计（按释放次数降序）。在锁内复制，供 UI 线程读取。</summary>
-    public List<SkillStat> Snapshot()
+    private void StartSession()
     {
+        byte jobId = PlayerStats.GetCurrentClassJobId();
+        string jobName = LookupJobName(jobId);
+        PlayerStats.TryGetRates(out double crit, out double dh);
+        this.current = new BattleRecord
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            StartedUnix = DateTimeOffset.Now.ToUnixTimeSeconds(),
+            JobId = jobId,
+            JobName = jobName,
+            CritRatePct = crit * 100.0,
+            DhRatePct = dh * 100.0,
+        };
+        this.log.Info($"[Is that a crit？] 开始记录战斗：{jobName}（理论暴击 {crit * 100:F1}% / 直击 {dh * 100:F1}%）");
+    }
+
+    private void EndSession()
+    {
+        var rec = this.current;
+        this.current = null;
+        if (rec == null)
+            return;
+
+        rec.EndedUnix = DateTimeOffset.Now.ToUnixTimeSeconds();
+        rec.BattleLuck = ComputeBattleLuck(rec);
+
         lock (this.lockObj)
         {
-            return this.stats.Values
-                .Select(s => new SkillStat
-                {
-                    ActionId = s.ActionId,
-                    Casts = s.Casts,
-                    Hits = s.Hits,
-                    Crit = s.Crit,
-                    DirectHit = s.DirectHit,
-                    CritDirect = s.CritDirect,
-                })
-                .OrderByDescending(s => s.Casts)
-                .ToList();
+            this.history.Add(rec);
+            while (this.history.Count > this.maxBattles)
+                this.history.RemoveAt(0);
         }
+        SaveHistory();
+        SaveTotals();
+        this.log.Info($"[Is that a crit？] 战斗结束：{rec.JobName}，技能 {rec.Skills.Count} 种，运气 {rec.BattleLuck:F0}");
     }
 
     private void Detour(uint casterEntityId, Character* casterPtr, Vector3* targetPos,
@@ -145,26 +212,24 @@ public unsafe class CombatTracker : IDisposable
             var local = this.objects.LocalPlayer;
             var localAddr = local?.Address ?? nint.Zero;
 
-            // 诊断：前 20 次任意回调记录来源匹配情况，确认钩子生效且过滤正确。
             if (this.diagCount < 20)
             {
                 this.diagCount++;
                 var match = localAddr != nint.Zero && (nint)casterPtr == localAddr;
                 var actionId = header != null ? header->ActionId : 0u;
                 var numT = header != null ? header->NumTargets : (byte)0;
-                var localObjId = local != null ? (uint)local.GameObjectId : 0u;
-                this.log.Info($"[爆了吗？][诊断] Receive #{this.diagCount} caster={casterEntityId} local={localObjId} match={match} action={actionId} numTargets={numT}");
+                this.log.Info($"[Is that a crit？][诊断] Receive #{this.diagCount} caster={casterEntityId} match={match} action={actionId} numTargets={numT}");
             }
 
             if (this.IsTrackingEnabled && localAddr != nint.Zero && casterPtr != null &&
                 header != null && effects != null && (nint)casterPtr == localAddr)
             {
-                ProcessActionEffect(header, effects);
+                RecordEffects(header, effects);
             }
         }
         catch (Exception ex)
         {
-            this.log.Error(ex, "[爆了吗？] Receive 回调异常。");
+            this.log.Error(ex, "[Is that a crit？] Receive 回调异常。");
         }
         finally
         {
@@ -172,7 +237,7 @@ public unsafe class CombatTracker : IDisposable
         }
     }
 
-    private void ProcessActionEffect(ActionEffectHandler.Header* header, ActionEffectHandler.TargetEffects* effects)
+    private void RecordEffects(ActionEffectHandler.Header* header, ActionEffectHandler.TargetEffects* effects)
     {
         var actionId = header->ActionId;
         if (actionId == 0)
@@ -182,52 +247,238 @@ public unsafe class CombatTracker : IDisposable
         if (numTargets == 0 || numTargets > 8)
             return;
 
-        // effects 指向 numTargets 个 TargetEffects，每个 0x40 字节（即 8 个连续的 Effect）。
-        // TargetEffects 在偏移 0 处就是 8 个 Effect，故可直接把首地址当作 Effect* 线性索引。
         var allEffects = (ActionEffectHandler.Effect*)effects;
 
-        SkillStat? stat = null;
+        long hits = 0, crit = 0, dh = 0, cd = 0;
+        for (var t = 0; t < numTargets; t++)
+        {
+            for (var e = 0; e < 8; e++)
+            {
+                var eff = allEffects[t * 8 + e];
+                if (eff.Type != TypeDamage)
+                    continue;
+                hits++;
+                var sev = eff.Param0;
+                if ((sev & SeverityCrit) != 0) crit++;
+                if ((sev & SeverityDirect) != 0) dh++;
+                if ((sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect)) cd++;
+            }
+        }
+
+        if (hits == 0)
+            return;
+
+        var jobId = this.current?.JobId ?? PlayerStats.GetCurrentClassJobId();
+        var hasLocalDetail = false;
+
         lock (this.lockObj)
         {
-            if (!this.stats.TryGetValue(actionId, out stat))
+            MergeInto(this.grandTotals, actionId, hits, crit, dh, cd);
+            if (!this.jobTotals.ContainsKey(jobId))
+                this.jobTotals[jobId] = new Dictionary<uint, SkillStat>();
+            MergeInto(this.jobTotals[jobId], actionId, hits, crit, dh, cd);
+            if (this.current != null)
             {
-                stat = new SkillStat { ActionId = actionId };
-                this.stats[actionId] = stat;
+                MergeInto(this.current.Skills, actionId, hits, crit, dh, cd);
+                hasLocalDetail = this.current.Skills.Count <= 1;
             }
+        }
 
-            var hasDamage = false;
-            for (var t = 0; t < numTargets; t++)
+        if (hasLocalDetail)
+        {
+            this.log.Info($"[Is that a crit？][解码] 首个伤害技能 action={actionId} 首效果: hits={hits} crit={crit} dh={dh} cd={cd}");
+        }
+    }
+
+    private static void MergeInto(Dictionary<uint, SkillStat> store, uint actionId, long hits, long crit, long dh, long cd)
+    {
+        if (!store.TryGetValue(actionId, out var s))
+        {
+            s = new SkillStat { ActionId = actionId };
+            store[actionId] = s;
+        }
+        s.Casts++;
+        s.Hits += hits;
+        s.Crit += crit;
+        s.DirectHit += dh;
+        s.CritDirect += cd;
+    }
+
+    private double ComputeBattleLuck(BattleRecord rec)
+    {
+        long hits = 0, crit = 0, dh = 0, cd = 0;
+        foreach (var s in rec.Skills.Values)
+        {
+            hits += s.Hits; crit += s.Crit; dh += s.DirectHit; cd += s.CritDirect;
+        }
+        double pCrit = rec.CritRatePct / 100.0;
+        double pDh = rec.DhRatePct / 100.0;
+        return LuckRating.ComputeScore(hits, crit, dh, cd, pCrit, pDh);
+    }
+
+    // ---------- 快照 / 查询 ----------
+
+    public List<SkillStat> SnapshotGrand()
+    {
+        lock (this.lockObj)
+            return this.grandTotals.Values.Select(s => Clone(s)).OrderByDescending(s => s.Casts).ToList();
+    }
+
+    public List<SkillStat> SnapshotJob(byte jobId)
+    {
+        lock (this.lockObj)
+            return this.jobTotals.TryGetValue(jobId, out var d)
+                ? d.Values.Select(s => Clone(s)).OrderByDescending(s => s.Casts).ToList()
+                : new List<SkillStat>();
+    }
+
+    public List<SkillStat> SnapshotCurrent()
+    {
+        lock (this.lockObj)
+            return this.current?.Skills.Values.Select(s => Clone(s)).OrderByDescending(s => s.Casts).ToList()
+                   ?? new List<SkillStat>();
+    }
+
+    public List<BattleRecord> GetHistory()
+    {
+        lock (this.lockObj)
+            return this.history.OrderByDescending(r => r.StartedUnix).ToList();
+    }
+
+    public BattleRecord? GetBattle(string id)
+    {
+        lock (this.lockObj)
+            return this.history.FirstOrDefault(r => r.Id == id);
+    }
+
+    public List<byte> GetTrackedJobIds()
+    {
+        lock (this.lockObj)
+            return this.jobTotals.Keys.OrderBy(k => k).ToList();
+    }
+
+    public bool IsInBattle => this.current != null;
+
+    /// <summary>运行时调整保留战斗场次上限（立即生效并裁剪历史）。</summary>
+    public int MaxBattles
+    {
+        set
+        {
+            this.maxBattles = Math.Max(1, value);
+            lock (this.lockObj)
             {
-                for (var e = 0; e < 8; e++)
+                while (this.history.Count > this.maxBattles)
+                    this.history.RemoveAt(0);
+            }
+            SaveHistory();
+        }
+    }
+
+    public void Reset()
+    {
+        EndSession();
+        lock (this.lockObj)
+        {
+            this.grandTotals.Clear();
+            this.jobTotals.Clear();
+            this.history.Clear();
+        }
+        SaveAll();
+    }
+
+    private static SkillStat Clone(SkillStat s) => new()
+    {
+        ActionId = s.ActionId, Casts = s.Casts, Hits = s.Hits,
+        Crit = s.Crit, DirectHit = s.DirectHit, CritDirect = s.CritDirect,
+    };
+
+    private string LookupJobName(byte jobId)
+    {
+        try
+        {
+            var sheet = this.dataManager.GetExcelSheet<ClassJob>();
+            var row = sheet.GetRow(jobId);
+            var name = row.Name.ToString();
+            return string.IsNullOrWhiteSpace(name) ? $"职业{jobId}" : name;
+        }
+        catch
+        {
+            return $"职业{jobId}";
+        }
+    }
+
+    // ---------- 持久化 ----------
+
+    private void LoadAll()
+    {
+        try
+        {
+            var histPath = Path.Combine(this.configDir, "history.json");
+            var totPath = Path.Combine(this.configDir, "totals.json");
+            if (File.Exists(totPath))
+            {
+                var tot = JsonConvert.DeserializeObject<TotalsStore>(File.ReadAllText(totPath));
+                if (tot != null)
                 {
-                    var eff = allEffects[t * 8 + e];
-                    if (eff.Type != TypeDamage)
-                        continue;
-
-                    hasDamage = true;
-                    stat.Hits++;
-
-                    var sev = eff.Param0;
-                    if ((sev & SeverityCrit) != 0)
-                        stat.Crit++;
-                    if ((sev & SeverityDirect) != 0)
-                        stat.DirectHit++;
-                    if ((sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect))
-                        stat.CritDirect++;
+                    this.grandTotals = tot.GrandTotals ?? new Dictionary<uint, SkillStat>();
+                    this.jobTotals = tot.JobTotals ?? new Dictionary<byte, Dictionary<uint, SkillStat>>();
                 }
             }
-
-            // 只有产生了伤害的技能才计入"释放次数"，自动过滤治疗/ buff 等非伤害技能。
-            if (hasDamage)
-                stat.Casts++;
+            if (File.Exists(histPath))
+            {
+                var hist = JsonConvert.DeserializeObject<List<BattleRecord>>(File.ReadAllText(histPath));
+                if (hist != null)
+                    this.history = hist;
+            }
         }
-
-        // 首次捕获到本地伤害技能时，记录首条效果的原始字节，便于核对解码是否正确。
-        if (!this.firstLocalDetailLogged && stat.Casts > 0)
+        catch (Exception ex)
         {
-            this.firstLocalDetailLogged = true;
-            var first = allEffects[0];
-            this.log.Info($"[爆了吗？][解码] 首个本地伤害技能 action={actionId} 首效果 Type=0x{first.Type:X2} Param0=0x{first.Param0:X2} Value={first.Value}");
+            this.log.Error(ex, "[Is that a crit？] 读取历史数据失败，将从空开始。");
         }
+    }
+
+    private void SaveHistory()
+    {
+        try
+        {
+            Directory.CreateDirectory(this.configDir);
+            List<BattleRecord> copy;
+            lock (this.lockObj) copy = this.history.ToList();
+            File.WriteAllText(Path.Combine(this.configDir, "history.json"),
+                JsonConvert.SerializeObject(copy, Formatting.Indented));
+        }
+        catch (Exception ex)
+        {
+            this.log.Error(ex, "[Is that a crit？] 保存历史失败。");
+        }
+    }
+
+    private void SaveTotals()
+    {
+        try
+        {
+            Directory.CreateDirectory(this.configDir);
+            TotalsStore store;
+            lock (this.lockObj)
+                store = new TotalsStore { GrandTotals = this.grandTotals, JobTotals = this.jobTotals };
+            File.WriteAllText(Path.Combine(this.configDir, "totals.json"),
+                JsonConvert.SerializeObject(store, Formatting.Indented));
+        }
+        catch (Exception ex)
+        {
+            this.log.Error(ex, "[Is that a crit？] 保存总计失败。");
+        }
+    }
+
+    private void SaveAll()
+    {
+        SaveHistory();
+        SaveTotals();
+    }
+
+    private sealed class TotalsStore
+    {
+        public Dictionary<uint, SkillStat>? GrandTotals;
+        public Dictionary<byte, Dictionary<uint, SkillStat>>? JobTotals;
     }
 }
