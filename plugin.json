@@ -1,0 +1,18 @@
+{
+  "InternalName": "BaoleMaLe",
+  "Name": "爆了吗？",
+  "Description": "统计玩家打出的伤害技能的释放/命中/直击/暴击/直暴次数与几率，并用 FFLogs 风格配色评价直暴运气。",
+  "Punchline": "你这一波，爆了吗？",
+  "Author": "斯温",
+  "Version": "0.1.0.0",
+  "DalamudApiLevel": 15,
+  "Tags": [
+    "combat",
+    "stats",
+    "crit",
+    "direct hit",
+    "luck"
+  ],
+  "Category": "Damage",
+  "Changelog": "初始版本：基于 ReceiveActionEffect 钩子统计伤害技能，并给出 FFLogs 风格运气评分。"
+}
