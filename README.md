@@ -46,10 +46,8 @@ BaoleMaLe/
 ├─ GlobalUsings.cs
 ├─ Plugin.cs               # 入口：服务注入、命令、窗口装配
 ├─ Configuration.cs        # 配置（持久化）
-├─ CombatTracker.cs        # 核心：ReceiveActionEffect 钩子 + 统计聚合
+├─ CombatTracker.cs        # 核心：ActionEffectHandler.Receive 钩子 + 统计聚合
 ├─ LuckRating.cs           # 直暴运气评分 + FFLogs 配色
-├─ Structs/
-│  └─ ActionEffect.cs      # 自带 ActionEffect / EffectEntry 结构体
 ├─ Windows/
 │  └─ MainWindow.cs        # ImGui 表格窗口
 └─ repo/
@@ -71,10 +69,11 @@ dotnet build BaoleMaLe.csproj -c Release
 
 ## 重要提示（钩子签名）
 
-伤害数据来自对 `ActionManager.ReceiveActionEffect` 的**签名扫描钩子**
-（签名见 `CombatTracker.cs` 的 `ReceiveActionEffectSig`）。
+伤害数据来自对 `ActionEffectHandler.Receive` 的**签名扫描钩子**
+（签名见 `CombatTracker.cs` 的 `ReceiveSig`，对应 FFXIV 7.x / Dawntrail 的战斗效果入口）。
 每个大版本更新后该签名可能变动；若插件加载后统计一直为 0，
-请按新版本更新该签名（可用 `Dalamud` 自带的 `SigScanner` / 反汇编工具获取）。
+请查看 Dalamud 日志中 `[爆了吗？]` 的诊断行（会显示钩子是否生效、来源是否命中本地玩家），
+并按新版本更新 `ReceiveSig`。
 
 ## 发布第三方裤链（GitHub Actions）
 
