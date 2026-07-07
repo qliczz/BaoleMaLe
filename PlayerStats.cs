@@ -1,6 +1,7 @@
 namespace BaoleMaLe;
 
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using Lumina.Excel.Sheets;
 
 /// <summary>
 /// 从角色面板（游戏内真实数据）读取暴击率 / 直击率，不再让用户手动填写。
@@ -104,6 +105,46 @@ public static class PlayerStats
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>当前所在地区的显示名（副本名 / 地图名）。读不到时返回 "未知区域"。</summary>
+    public static string GetCurrentZoneName()
+    {
+        try
+        {
+            var cs = DalamudApi.ClientState;
+            if (cs == null)
+                return "未知区域";
+            uint tid = cs.TerritoryType;
+            var sheet = DalamudApi.DataManager?.GetExcelSheet<TerritoryType>();
+            var row = sheet?.GetRow(tid);
+            if (row == null)
+                return "未知区域";
+            var r = row.Value;
+
+            string? TryName(Func<string> f)
+            {
+                try
+                {
+                    var s = f();
+                    return string.IsNullOrWhiteSpace(s) ? null : s;
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            // 优先用副本/任务名（ContentFinderCondition），其次地图分区名，最后地区本名。
+            return TryName(() => r.ContentFinderCondition.Value.Name.ToString())
+                   ?? TryName(() => r.PlaceNameZone.Value.Name.ToString())
+                   ?? TryName(() => r.Name.ToString())
+                   ?? $"区域 {tid}";
+        }
+        catch
+        {
+            return "未知区域";
         }
     }
 
