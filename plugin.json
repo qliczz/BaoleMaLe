@@ -1,18 +1,19 @@
 {
   "InternalName": "BaoleMaLe",
-  "Name": "爆了吗？",
-  "Description": "统计玩家打出的伤害技能的释放/命中/直击/暴击/直暴次数与几率，并用 FFLogs 风格配色评价直暴运气。",
-  "Punchline": "你这一波，爆了吗？",
+  "Name": "Is that a crit？",
+  "Description": "统计玩家打出的伤害技能的释放/命中/直击/暴击/直暴次数与几率，按暴击/直击率（自动取自角色面板）用 FFLogs 风格配色评价直暴运气，并自动分段记录每场战斗、分职业统计。",
+  "Punchline": "Is that a crit？",
   "Author": "斯温",
-  "Version": "0.1.1.0",
+  "Version": "0.2.0.0",
   "DalamudApiLevel": 15,
   "Tags": [
     "combat",
     "stats",
     "crit",
     "direct hit",
-    "luck"
+    "luck",
+    "history"
   ],
   "Category": "Damage",
-  "Changelog": "修复 7.x 数据采集：改用 ActionEffectHandler.Receive 钩子与 7.x 效果编码（Type=0x03 伤害，Param0 严重度 0x20/0x40/0x60）。"
+  "Changelog": "v0.2.0.0：① 更名 Is that a crit？ ② 暴击率/直击率改为自动从角色面板获取（不再手动填写），运气评分以面板理论几率为零假设 ③ 自动按战斗分段（Character.InCombat），分职业统计，并提供战斗记录库（可查看过去 N 场战斗的逐技能明细）。"
 }
