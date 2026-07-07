@@ -3,7 +3,7 @@
   <!-- Project settings -->
   <PropertyGroup>
     <Name>Is that a crit？</Name>
-    <Version>0.2.0.1</Version>
+    <Version>0.3.0.0</Version>
     <Author>斯温</Author>
     <RepoUrl>https://github.com/qliczz/BaoleMaLe</RepoUrl>
     <Punchline>Is that a crit？</Punchline>
