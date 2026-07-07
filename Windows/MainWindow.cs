@@ -158,13 +158,20 @@ public class MainWindow : Window
         long totalCrit = filtered.Sum(r => r.Crit);
         long totalDh = filtered.Sum(r => r.DirectHit);
         long totalCd = filtered.Sum(r => r.CritDirect);
+        ulong totalDmgSum = filtered.Aggregate(0UL, (a, r) => a + r.DamageSum);
+        uint totalDmgMax = filtered.Where(r => r.DamageCount > 0).Aggregate(0u, (m, r) => Math.Max(m, r.DamageMax));
+        uint totalDmgMin = filtered.Where(r => r.DamageCount > 0).Aggregate(uint.MaxValue, (m, r) => Math.Min(m, r.DamageMin));
+        uint totalDmgCount = (uint)filtered.Sum(r => (long)r.DamageCount);
 
-        if (ImGui.BeginTable("##IsThatACritTable", 9,
-                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
+        if (ImGui.BeginTable("##IsThatACritTable", 12,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY | ImGuiTableFlags.ScrollX))
         {
             ImGui.TableSetupColumn("技能", ImGuiTableColumnFlags.WidthStretch, 2.4f);
             ImGui.TableSetupColumn("释放", ImGuiTableColumnFlags.WidthFixed, 56f);
             ImGui.TableSetupColumn("命中", ImGuiTableColumnFlags.WidthFixed, 56f);
+            ImGui.TableSetupColumn("最高伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
+            ImGui.TableSetupColumn("最低伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
+            ImGui.TableSetupColumn("平均伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
             ImGui.TableSetupColumn("直击", ImGuiTableColumnFlags.WidthFixed, 110f);
             ImGui.TableSetupColumn("暴击", ImGuiTableColumnFlags.WidthFixed, 110f);
             ImGui.TableSetupColumn("直暴", ImGuiTableColumnFlags.WidthFixed, 110f);
@@ -175,13 +182,15 @@ public class MainWindow : Window
 
             double totalScore = LuckRating.ComputeScore(totalHits, totalCrit, totalDh, totalCd, scopeCrit, scopeDh);
             double totalExpected = LuckRating.ExpectedCritDirect(totalHits, scopeCrit, scopeDh);
-            DrawRow("合计", totalCasts, totalHits, totalCrit, totalDh, totalCd, totalExpected, TotalSentinel, scopeCrit, scopeDh, totalScore);
+            DrawRow("合计", totalCasts, totalHits, totalCrit, totalDh, totalCd, totalExpected, TotalSentinel, scopeCrit, scopeDh, totalScore,
+                totalDmgSum, totalDmgMax, totalDmgMin, totalDmgCount);
 
             foreach (var s in filtered)
             {
                 double expected = LuckRating.ExpectedCritDirect(s.Hits, scopeCrit, scopeDh);
                 double score = LuckRating.ComputeScore(s.Hits, s.Crit, s.DirectHit, s.CritDirect, scopeCrit, scopeDh);
-                DrawRow(LookupName(s.ActionId), s.Casts, s.Hits, s.Crit, s.DirectHit, s.CritDirect, expected, s.ActionId, scopeCrit, scopeDh, score);
+                DrawRow(LookupName(s.ActionId), s.Casts, s.Hits, s.Crit, s.DirectHit, s.CritDirect, expected, s.ActionId, scopeCrit, scopeDh, score,
+                    s.DamageSum, s.DamageMax, s.DamageMin, s.DamageCount);
             }
 
             ImGui.EndTable();
@@ -189,7 +198,8 @@ public class MainWindow : Window
     }
 
     private void DrawRow(string name, long casts, long hits, long crit, long dh, long cd,
-        double expectedCd, uint actionId, double pCrit, double pDh, double score)
+        double expectedCd, uint actionId, double pCrit, double pDh, double score,
+        ulong dmgSum, uint dmgMax, uint dmgMin, uint dmgCount)
     {
         ImGui.TableNextRow();
 
@@ -208,6 +218,8 @@ public class MainWindow : Window
 
         ImGui.TableNextColumn();
         ImGui.TextUnformatted(hits.ToString("N0"));
+
+        DrawDamageCells(dmgSum, dmgMax, dmgMin, dmgCount);
 
         ImGui.TableNextColumn();
         DrawRate(dh, hits);
@@ -257,6 +269,20 @@ public class MainWindow : Window
         }
     }
 
+    private static void DrawDamageCells(ulong dmgSum, uint dmgMax, uint dmgMin, uint dmgCount)
+    {
+        if (dmgCount == 0)
+        {
+            ImGui.TableNextColumn(); ImGui.TextUnformatted("—");
+            ImGui.TableNextColumn(); ImGui.TextUnformatted("—");
+            ImGui.TableNextColumn(); ImGui.TextUnformatted("—");
+            return;
+        }
+        ImGui.TableNextColumn(); ImGui.TextUnformatted(dmgMax.ToString("N0"));
+        ImGui.TableNextColumn(); ImGui.TextUnformatted(dmgMin.ToString("N0"));
+        ImGui.TableNextColumn(); ImGui.TextUnformatted((dmgSum / (double)dmgCount).ToString("N0"));
+    }
+
     private void DrawRate(long count, long hits)
     {
         if (hits <= 0)
@@ -284,10 +310,11 @@ public class MainWindow : Window
 
         ImGui.TextUnformatted($"共记录 {history.Count} 场战斗（保留上限 {this.config.MaxBattles}）。点击一场查看该场的技能明细。");
 
-        if (ImGui.BeginTable("##BattleList", 5, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
+        if (ImGui.BeginTable("##BattleList", 6, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollX))
         {
             ImGui.TableSetupColumn("开始时间", ImGuiTableColumnFlags.WidthFixed, 150f);
-            ImGui.TableSetupColumn("职业", ImGuiTableColumnFlags.WidthFixed, 140f);
+            ImGui.TableSetupColumn("职业", ImGuiTableColumnFlags.WidthFixed, 110f);
+            ImGui.TableSetupColumn("场地", ImGuiTableColumnFlags.WidthFixed, 170f);
             ImGui.TableSetupColumn("时长", ImGuiTableColumnFlags.WidthFixed, 80f);
             ImGui.TableSetupColumn("技能数", ImGuiTableColumnFlags.WidthFixed, 70f);
             ImGui.TableSetupColumn("整场运气", ImGuiTableColumnFlags.WidthFixed, 160f);
@@ -302,6 +329,8 @@ public class MainWindow : Window
                     this.selectedBattleId = b.Id;
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(b.JobName);
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(string.IsNullOrWhiteSpace(b.ZoneName) ? "未知区域" : b.ZoneName);
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(FormatDuration(b.StartedUnix, b.EndedUnix));
                 ImGui.TableNextColumn();
@@ -325,7 +354,7 @@ public class MainWindow : Window
             return;
 
         ImGui.Separator();
-        ImGui.TextUnformatted($"【{battle.JobName}】开始 {FormatTime(battle.StartedUnix)} ｜ 时长 {FormatDuration(battle.StartedUnix, battle.EndedUnix)} ｜ 面板理论 暴击 {battle.CritRatePct:F1}% / 直击 {battle.DhRatePct:F1}%");
+        ImGui.TextUnformatted($"【{battle.JobName} @ {battle.ZoneName}】开始 {FormatTime(battle.StartedUnix)} ｜ 时长 {FormatDuration(battle.StartedUnix, battle.EndedUnix)} ｜ 面板理论 暴击 {battle.CritRatePct:F1}% / 直击 {battle.DhRatePct:F1}%");
 
         double pCrit = battle.CritRatePct / 100.0;
         double pDh = battle.DhRatePct / 100.0;
@@ -335,12 +364,15 @@ public class MainWindow : Window
             .OrderByDescending(r => r.Casts)
             .ToList();
 
-        if (ImGui.BeginTable("##BattleDetail", 9,
-                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
+        if (ImGui.BeginTable("##BattleDetail", 12,
+                ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY | ImGuiTableFlags.ScrollX))
         {
             ImGui.TableSetupColumn("技能", ImGuiTableColumnFlags.WidthStretch, 2.4f);
             ImGui.TableSetupColumn("释放", ImGuiTableColumnFlags.WidthFixed, 56f);
             ImGui.TableSetupColumn("命中", ImGuiTableColumnFlags.WidthFixed, 56f);
+            ImGui.TableSetupColumn("最高伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
+            ImGui.TableSetupColumn("最低伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
+            ImGui.TableSetupColumn("平均伤害", ImGuiTableColumnFlags.WidthFixed, 92f);
             ImGui.TableSetupColumn("直击", ImGuiTableColumnFlags.WidthFixed, 110f);
             ImGui.TableSetupColumn("暴击", ImGuiTableColumnFlags.WidthFixed, 110f);
             ImGui.TableSetupColumn("直暴", ImGuiTableColumnFlags.WidthFixed, 110f);
@@ -353,7 +385,8 @@ public class MainWindow : Window
             {
                 double expected = LuckRating.ExpectedCritDirect(s.Hits, pCrit, pDh);
                 double score = LuckRating.ComputeScore(s.Hits, s.Crit, s.DirectHit, s.CritDirect, pCrit, pDh);
-                DrawRow(LookupName(s.ActionId), s.Casts, s.Hits, s.Crit, s.DirectHit, s.CritDirect, expected, s.ActionId, pCrit, pDh, score);
+                DrawRow(LookupName(s.ActionId), s.Casts, s.Hits, s.Crit, s.DirectHit, s.CritDirect, expected, s.ActionId, pCrit, pDh, score,
+                    s.DamageSum, s.DamageMax, s.DamageMin, s.DamageCount);
             }
             ImGui.EndTable();
         }
