@@ -82,7 +82,7 @@ public class MainWindow : Window
         if (filtered.Count == 0)
         {
             ImGui.TextUnformatted("还没有数据。进本打几套技能，再回来看看你爆了没。");
-            ImGui.TextUnformatted("（提示：若统计一直为 0，多半是游戏版本更新导致钩子签名失效，请更新 CombatTracker 里的 ReceiveActionEffectSig。）");
+            ImGui.TextUnformatted("（提示：若统计一直为 0，多半是游戏版本更新导致钩子签名失效，或来源过滤未命中本地玩家，请查看 Dalamud 日志中 [爆了吗？] 的诊断行。）");
             return;
         }
 
