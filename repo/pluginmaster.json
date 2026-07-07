@@ -1,14 +1,14 @@
 {
-  "Name": "爆了吗？",
+  "Name": "Is that a crit？",
   "InternalName": "BaoleMaLe",
-  "AssemblyVersion": "0.1.0.0",
-  "TestingAssemblyVersion": "0.1.0.0",
+  "AssemblyVersion": "0.2.0.0",
+  "TestingAssemblyVersion": "0.2.0.0",
   "DalamudApiLevel": 15,
   "Author": "斯温",
-  "Description": "统计玩家打出的伤害技能，并给出 FFLogs 风格直暴运气评分。",
+  "Description": "统计玩家打出的伤害技能的直暴运气，按角色面板理论几率评分，并自动分段记录每场战斗、分职业统计。",
   "RepoUrl": "https://github.com/qliczz/BaoleMaLe",
-  "DownloadLinkInstall": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
-  "DownloadLinkUpdate": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
-  "DownloadLinkTesting": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.1.0.0/BaoleMaLe.zip",
-  "Changelog": "初始版本。"
+  "DownloadLinkInstall": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
+  "DownloadLinkUpdate": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
+  "DownloadLinkTesting": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
+  "Changelog": "v0.2.0.0: rename Is that a crit？; auto panel crit/dh rates; per-job stats; battle history library."
 }
