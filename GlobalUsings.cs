@@ -1,0 +1,22 @@
+global using System;
+global using System.Collections.Generic;
+global using System.Linq;
+global using System.Numerics;
+global using System.Runtime.CompilerServices;
+global using System.Runtime.InteropServices;
+global using System.Text;
+global using Dalamud.Bindings.ImGui;
+global using Dalamud.Game;
+global using Dalamud.Game.ClientState.Objects;
+global using Dalamud.Game.ClientState.Objects.Types;
+global using Dalamud.Game.Command;
+global using Dalamud.Hooking;
+global using Dalamud.Interface.Utility.Raii;
+global using Dalamud.Interface.Windowing;
+global using Dalamud.Plugin;
+global using Dalamud.Plugin.Services;
+global using FFXIVClientStructs;
+global using FFXIVClientStructs.FFXIV.Client.Game;
+global using Lumina.Excel.Sheets;
+// 消除 System.Action(委托) 与 Lumina 的 Action(技能表) 的命名冲突，默认指向技能表。
+global using Action = Lumina.Excel.Sheets.Action;
