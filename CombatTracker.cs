@@ -29,12 +29,26 @@ public sealed class SkillStat
     /// <summary>直暴（暴击且直击）次数。</summary>
     public long CritDirect;
 
+    /// <summary>伤害总和（所有命中造成的伤害累加）。</summary>
+    public ulong DamageSum;
+
+    /// <summary>单次命中造成的最高伤害。</summary>
+    public uint DamageMax;
+
+    /// <summary>单次命中造成的最低伤害（初始为 uint.MaxValue，便于取 min）。</summary>
+    public uint DamageMin = uint.MaxValue;
+
+    /// <summary>记录到伤害的次数（等于 DamageSum 的取样数）。</summary>
+    public uint DamageCount;
+
     [JsonIgnore]
     public double CritRate => Hits > 0 ? (double)Crit / Hits : 0;
     [JsonIgnore]
     public double DirectHitRate => Hits > 0 ? (double)DirectHit / Hits : 0;
     [JsonIgnore]
     public double CritDirectRate => Hits > 0 ? (double)CritDirect / Hits : 0;
+    [JsonIgnore]
+    public double AvgDamage => DamageCount > 0 ? (double)DamageSum / DamageCount : 0;
 }
 
 /// <summary>
@@ -47,6 +61,8 @@ public sealed class BattleRecord
     public long EndedUnix;
     public byte JobId;
     public string JobName = "";
+    /// <summary>战斗发生的场地名（副本名 / 地图名），开场时从 TerritoryType 读取。</summary>
+    public string ZoneName = "";
     /// <summary>开场时从角色面板读取的理论暴击率（%，0–100）。</summary>
     public double CritRatePct;
     /// <summary>开场时从角色面板读取的理论直击率（%，0–100）。</summary>
@@ -170,6 +186,7 @@ public unsafe class CombatTracker : IDisposable
     {
         byte jobId = PlayerStats.GetCurrentClassJobId();
         string jobName = LookupJobName(jobId);
+        string zoneName = PlayerStats.GetCurrentZoneName();
         PlayerStats.TryGetRates(out double crit, out double dh);
         this.current = new BattleRecord
         {
@@ -177,10 +194,11 @@ public unsafe class CombatTracker : IDisposable
             StartedUnix = DateTimeOffset.Now.ToUnixTimeSeconds(),
             JobId = jobId,
             JobName = jobName,
+            ZoneName = zoneName,
             CritRatePct = crit * 100.0,
             DhRatePct = dh * 100.0,
         };
-        this.log.Info($"[Is that a crit？] 开始记录战斗：{jobName}（理论暴击 {crit * 100:F1}% / 直击 {dh * 100:F1}%）");
+        this.log.Info($"[Is that a crit？] 开始记录战斗：{jobName} @ {zoneName}（理论暴击 {crit * 100:F1}% / 直击 {dh * 100:F1}%）");
     }
 
     private void EndSession()
@@ -250,6 +268,10 @@ public unsafe class CombatTracker : IDisposable
         var allEffects = (ActionEffectHandler.Effect*)effects;
 
         long hits = 0, crit = 0, dh = 0, cd = 0;
+        ulong dmgSum = 0;
+        uint dmgMax = 0;
+        uint dmgMin = uint.MaxValue;
+        uint dmgCount = 0;
         for (var t = 0; t < numTargets; t++)
         {
             for (var e = 0; e < 8; e++)
@@ -262,6 +284,13 @@ public unsafe class CombatTracker : IDisposable
                 if ((sev & SeverityCrit) != 0) crit++;
                 if ((sev & SeverityDirect) != 0) dh++;
                 if ((sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect)) cd++;
+
+                // 7.x 伤害数值存放在 Effect.Value（offset 6，ushort）。
+                var dmg = (uint)eff.Value;
+                dmgCount++;
+                dmgSum += dmg;
+                if (dmg > dmgMax) dmgMax = dmg;
+                if (dmg < dmgMin) dmgMin = dmg;
             }
         }
 
@@ -273,13 +302,13 @@ public unsafe class CombatTracker : IDisposable
 
         lock (this.lockObj)
         {
-            MergeInto(this.grandTotals, actionId, hits, crit, dh, cd);
+            MergeInto(this.grandTotals, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
             if (!this.jobTotals.ContainsKey(jobId))
                 this.jobTotals[jobId] = new Dictionary<uint, SkillStat>();
-            MergeInto(this.jobTotals[jobId], actionId, hits, crit, dh, cd);
+            MergeInto(this.jobTotals[jobId], actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
             if (this.current != null)
             {
-                MergeInto(this.current.Skills, actionId, hits, crit, dh, cd);
+                MergeInto(this.current.Skills, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
                 hasLocalDetail = this.current.Skills.Count <= 1;
             }
         }
@@ -290,7 +319,8 @@ public unsafe class CombatTracker : IDisposable
         }
     }
 
-    private static void MergeInto(Dictionary<uint, SkillStat> store, uint actionId, long hits, long crit, long dh, long cd)
+    private static void MergeInto(Dictionary<uint, SkillStat> store, uint actionId,
+        long hits, long crit, long dh, long cd, ulong dmgSum, uint dmgMax, uint dmgMin, uint dmgCount)
     {
         if (!store.TryGetValue(actionId, out var s))
         {
@@ -302,6 +332,11 @@ public unsafe class CombatTracker : IDisposable
         s.Crit += crit;
         s.DirectHit += dh;
         s.CritDirect += cd;
+        s.DamageSum += dmgSum;
+        s.DamageCount += dmgCount;
+        if (dmgMax > s.DamageMax) s.DamageMax = dmgMax;
+        // 仅在确有伤害取样时更新最小值（初始 uint.MaxValue 不算）。
+        if (dmgCount > 0 && dmgMin < s.DamageMin) s.DamageMin = dmgMin;
     }
 
     private double ComputeBattleLuck(BattleRecord rec)
@@ -390,6 +425,8 @@ public unsafe class CombatTracker : IDisposable
     {
         ActionId = s.ActionId, Casts = s.Casts, Hits = s.Hits,
         Crit = s.Crit, DirectHit = s.DirectHit, CritDirect = s.CritDirect,
+        DamageSum = s.DamageSum, DamageMax = s.DamageMax,
+        DamageMin = s.DamageMin, DamageCount = s.DamageCount,
     };
 
     private string LookupJobName(byte jobId)
