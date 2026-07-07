@@ -1,6 +1,7 @@
 namespace BaoleMaLe;
 
-using BaoleMaLe.Structs;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
+using GameObjectId = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectId;
 
 /// <summary>
 /// 单个动作（技能）的累计统计。所有计数线程安全（由 CombatTracker 的锁保护）。
@@ -9,10 +10,10 @@ public sealed class SkillStat
 {
     public uint ActionId;
 
-    /// <summary>释放次数：ReceiveActionEffect 回调中、来源为本地玩家、ActionId 有效的次数。</summary>
+    /// <summary>释放次数：本地玩家施放该伤害技能的次数（一次 Receive 调用计 1 次，多段/AoE 也只算 1 次释放）。</summary>
     public long Casts;
 
-    /// <summary>命中次数：造成实际伤害(EffectType==1)的效果条目数（多段/AoE 会 &gt; 释放次数）。</summary>
+    /// <summary>命中次数：造成实际伤害(Effect.Type==0x03)的效果条目数（多段/AoE 会 &gt; 释放次数）。</summary>
     public long Hits;
 
     /// <summary>暴击次数（含直暴）。</summary>
@@ -30,14 +31,25 @@ public sealed class SkillStat
 }
 
 /// <summary>
-/// 战斗统计核心：通过钩住 ActionManager.ReceiveActionEffect 捕获玩家打出的每一个伤害技能，
-/// 并逐条累计 释放/命中/暴击/直击/直暴 次数。
+/// 战斗统计核心：钩住 <see cref="ActionEffectHandler.Receive"/>（FFXIV 7.x / Dawntrail 的战斗效果入口），
+/// 捕获本地玩家打出的每一个伤害技能，逐条累计 释放/命中/暴击/直击/直暴 次数。
+///
+/// 7.x 效果条目编码（参见 ACT_Tech_Guide 7.0）：
+///   每条 Effect 8 字节：[Type][Param0]…[Value]
+///   - Type == 0x03 表示"造成伤害"（一次命中）
+///   - Param0 为严重度：0x20=暴击，0x40=直击，0x60=暴击+直击（普通为 0）
 /// </summary>
 public unsafe class CombatTracker : IDisposable
 {
-    // 经典 ReceiveActionEffect 签名（每个大版本可能变动，失效时请更新此签名）。
-    private const string ReceiveActionEffectSig =
-        "48 89 5C 24 ?? 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 60 48 8B D9";
+    // ActionEffectHandler.Receive 的签名（FFXIVClientStructs 7.x / Dawntrail 文档签名）。
+    // 每个大版本可能变动；失效时请更新此签名（插件会优雅降级并在日志提示）。
+    private const string ReceiveSig =
+        "E8 ?? ?? ?? ?? 48 8B 8D ?? ?? ?? ?? 48 33 CC E8 ?? ?? ?? ?? 48 81 C4 00 05 00 00";
+
+    // 效果条目里"造成伤害"的 Type 值，以及严重度位。
+    private const byte TypeDamage = 0x03;
+    private const byte SeverityCrit = 0x20;
+    private const byte SeverityDirect = 0x40;
 
     private readonly IGameInteropProvider interop;
     private readonly ISigScanner sigScanner;
@@ -47,22 +59,23 @@ public unsafe class CombatTracker : IDisposable
     private readonly Dictionary<uint, SkillStat> stats = new();
     private readonly object lockObj = new();
 
-    private Hook<ReceiveActionEffectDelegate>? hook;
+    private Hook<ReceiveDelegate>? hook;
+
+    // 诊断计数：前若干次回调记录到日志，便于确认钩子是否生效、来源过滤是否正确。
+    private int diagCount;
+    private bool firstLocalDetailLogged;
 
     public bool IsTrackingEnabled { get; set; } = true;
 
-    // ReceiveActionEffect 回调委托签名（agent 为 ActionManager 实例指针）。
-    private unsafe delegate void ReceiveActionEffectDelegate(
-        IntPtr agent,
-        uint sourceId,
-        IntPtr sourceStruct,
-        IntPtr dataGlobal,
-        IntPtr dataHome,
-        IntPtr dataOrigin,
-        uint flags,
-        IntPtr actionEffectArray,
-        IntPtr targetActor,
-        void* param);
+    // 与 ActionEffectHandler.Receive 完全一致的委托签名。
+    private unsafe delegate void ReceiveDelegate(
+        uint casterEntityId,
+        Character* casterPtr,
+        Vector3* targetPos,
+        ActionEffectHandler.Header* header,
+        ActionEffectHandler.TargetEffects* effects,
+        GameObjectId* targetEntityIds);
+
 
     public CombatTracker(IGameInteropProvider interop, ISigScanner sigScanner,
         IObjectTable objects, IPluginLog log)
@@ -78,15 +91,15 @@ public unsafe class CombatTracker : IDisposable
     {
         try
         {
-            var addr = this.sigScanner.ScanText(ReceiveActionEffectSig);
-            this.hook = this.interop.HookFromAddress<ReceiveActionEffectDelegate>(addr, Detour);
+            var addr = this.sigScanner.ScanText(ReceiveSig);
+            this.hook = this.interop.HookFromAddress<ReceiveDelegate>(addr, Detour);
             this.hook.Enable();
-            this.log.Info("[爆了吗？] ReceiveActionEffect 钩子已启用。");
+            this.log.Info("[爆了吗？] ActionEffectHandler.Receive 钩子已启用。");
         }
         catch (Exception ex)
         {
             this.hook = null;
-            this.log.Error(ex, "[爆了吗？] 无法安装 ReceiveActionEffect 钩子，伤害统计将不可用（可能是游戏版本更新导致签名失效，请更新 ReceiveActionEffectSig）。");
+            this.log.Error(ex, "[爆了吗？] 无法安装 Receive 钩子，伤害统计将不可用（可能是游戏版本更新导致签名失效，请更新 ReceiveSig）。");
         }
     }
 
@@ -124,38 +137,54 @@ public unsafe class CombatTracker : IDisposable
         }
     }
 
-    private void Detour(IntPtr agent, uint sourceId, IntPtr sourceStruct, IntPtr dataGlobal,
-        IntPtr dataHome, IntPtr dataOrigin, uint flags, IntPtr actionEffectArray, IntPtr targetActor, void* param)
+    private void Detour(uint casterEntityId, Character* casterPtr, Vector3* targetPos,
+        ActionEffectHandler.Header* header, ActionEffectHandler.TargetEffects* effects, GameObjectId* targetEntityIds)
     {
         try
         {
-            var localPlayer = this.objects.LocalPlayer;
-            if (this.IsTrackingEnabled && localPlayer != null && actionEffectArray != IntPtr.Zero)
+            var local = this.objects.LocalPlayer;
+            var localAddr = local?.Address ?? nint.Zero;
+
+            // 诊断：前 20 次任意回调记录来源匹配情况，确认钩子生效且过滤正确。
+            if (this.diagCount < 20)
             {
-                var localId = localPlayer.GameObjectId;
-                if (sourceId == localId)
-                    ProcessActionEffect(actionEffectArray);
+                this.diagCount++;
+                var match = localAddr != nint.Zero && (nint)casterPtr == localAddr;
+                var actionId = header != null ? header->ActionId : 0u;
+                var numT = header != null ? header->NumTargets : (byte)0;
+                var localObjId = local != null ? (uint)local.GameObjectId : 0u;
+                this.log.Info($"[爆了吗？][诊断] Receive #{this.diagCount} caster={casterEntityId} local={localObjId} match={match} action={actionId} numTargets={numT}");
+            }
+
+            if (this.IsTrackingEnabled && localAddr != nint.Zero && casterPtr != null &&
+                header != null && effects != null && (nint)casterPtr == localAddr)
+            {
+                ProcessActionEffect(header, effects);
             }
         }
         catch (Exception ex)
         {
-            this.log.Error(ex, "[爆了吗？] ReceiveActionEffect 回调异常。");
+            this.log.Error(ex, "[爆了吗？] Receive 回调异常。");
         }
         finally
         {
-            this.hook!.Original(agent, sourceId, sourceStruct, dataGlobal, dataHome, dataOrigin, flags, actionEffectArray, targetActor, param);
+            this.hook!.Original(casterEntityId, casterPtr, targetPos, header, effects, targetEntityIds);
         }
     }
 
-    private void ProcessActionEffect(IntPtr ptr)
+    private void ProcessActionEffect(ActionEffectHandler.Header* header, ActionEffectHandler.TargetEffects* effects)
     {
-        var ae = (ActionEffect*)ptr;
-        var actionId = ae->ActionId;
+        var actionId = header->ActionId;
         if (actionId == 0)
             return;
 
-        // 效果数组从偏移 0x20 开始，共 64 个 EffectEntry（8 目标 × 8 效果）。
-        var entries = (EffectEntry*)((byte*)ptr + 0x20);
+        var numTargets = header->NumTargets;
+        if (numTargets == 0 || numTargets > 8)
+            return;
+
+        // effects 指向 numTargets 个 TargetEffects，每个 0x40 字节（即 8 个连续的 Effect）。
+        // TargetEffects 在偏移 0 处就是 8 个 Effect，故可直接把首地址当作 Effect* 线性索引。
+        var allEffects = (ActionEffectHandler.Effect*)effects;
 
         SkillStat? stat = null;
         lock (this.lockObj)
@@ -165,32 +194,40 @@ public unsafe class CombatTracker : IDisposable
                 stat = new SkillStat { ActionId = actionId };
                 this.stats[actionId] = stat;
             }
-            stat.Casts++;
 
-            for (int i = 0; i < 64; i++)
+            var hasDamage = false;
+            for (var t = 0; t < numTargets; t++)
             {
-                var e = entries[i];
-                if (e.EffectType != 1) // 1 = 造成伤害
-                    continue;
-
-                stat.Hits++;
-
-                switch (e.HitSeverity)
+                for (var e = 0; e < 8; e++)
                 {
-                    case 1: // 暴击
+                    var eff = allEffects[t * 8 + e];
+                    if (eff.Type != TypeDamage)
+                        continue;
+
+                    hasDamage = true;
+                    stat.Hits++;
+
+                    var sev = eff.Param0;
+                    if ((sev & SeverityCrit) != 0)
                         stat.Crit++;
-                        break;
-                    case 2: // 直击
+                    if ((sev & SeverityDirect) != 0)
                         stat.DirectHit++;
-                        break;
-                    case 3: // 直暴（暴击 + 直击）
-                        stat.Crit++;
-                        stat.DirectHit++;
+                    if ((sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect))
                         stat.CritDirect++;
-                        break;
-                    // 0 = 普通，不计额外标记
                 }
             }
+
+            // 只有产生了伤害的技能才计入"释放次数"，自动过滤治疗/ buff 等非伤害技能。
+            if (hasDamage)
+                stat.Casts++;
+        }
+
+        // 首次捕获到本地伤害技能时，记录首条效果的原始字节，便于核对解码是否正确。
+        if (!this.firstLocalDetailLogged && stat.Casts > 0)
+        {
+            this.firstLocalDetailLogged = true;
+            var first = allEffects[0];
+            this.log.Info($"[爆了吗？][解码] 首个本地伤害技能 action={actionId} 首效果 Type=0x{first.Type:X2} Param0=0x{first.Param0:X2} Value={first.Value}");
         }
     }
 }
