@@ -9,7 +9,7 @@ using Dalamud.Configuration;
 public class Configuration : IPluginConfiguration
 {
     /// <summary>配置版本，IPluginConfiguration 要求。</summary>
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = 2;
 
     /// <summary>是否启用伤害技能统计。</summary>
     public bool EnableTracking { get; set; } = true;
@@ -20,14 +20,8 @@ public class Configuration : IPluginConfiguration
     /// <summary>释放次数低于该值的技能不显示在表格里（减少噪声）。</summary>
     public int MinCastsToShow { get; set; } = 1;
 
-    /// <summary>
-    /// 手动暴击率（0–100）。为 0 时使用会话内观测到的边际暴击率自动估算
-    /// （即当前实际打出来的暴击比例）。填非 0 则按理论值比较"直暴"运气。
-    /// </summary>
-    public float ManualCritRate { get; set; } = 0f;
-
-    /// <summary>手动直击率（0–100）。为 0 时同 ManualCritRate 自动估算。</summary>
-    public float ManualDirectHitRate { get; set; } = 0f;
+    /// <summary>数据浏览库保留的最近战斗场次（超出后丢弃最旧）。</summary>
+    public int MaxBattles { get; set; } = 50;
 
     /// <summary>主窗口是否打开。</summary>
     public bool MainWindowOpen { get; set; } = true;
