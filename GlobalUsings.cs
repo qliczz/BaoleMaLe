@@ -15,6 +15,8 @@ global using Dalamud.Interface.Utility.Raii;
 global using Dalamud.Interface.Windowing;
 global using Dalamud.Plugin;
 global using Dalamud.Plugin.Services;
+global using Dalamud.Game.ClientState.Party;
+global using Dalamud.Interface.Textures;
 global using FFXIVClientStructs;
 global using FFXIVClientStructs.FFXIV.Client.Game;
 global using Lumina.Excel.Sheets;
