@@ -3,15 +3,16 @@ namespace BaoleMaLe;
 /// <summary>
 /// 直暴运气评分。
 ///
-/// 思路：FFXIV 中"暴击"与"直击"是两次独立判定，因此一个技能打出"直暴(CD)"的
-/// 理论概率 = 暴击率 × 直击率。
+/// 【v0.4.2 起改用「自我历史基线」】不再用角色面板的理论基础概率当尺子——
+/// 因为实战里很多动作本就不进暴击判定（DoT、部分 oGCD、某些职业平A），
+/// 真实平均直暴率远低于面板值，拿它当基线会把"正常发挥"误判成"非酋"，
+/// 也违背"玩家不可能全程百分百暴击"的直觉。
 ///
-/// 这里用<b>角色面板真实理论几率</b>（从游戏内数值换算得到，见 PlayerStats）作为零假设，
-/// 比较"实际直暴次数"与"期望直暴次数"的偏差（以二项分布标准差为单位），
-/// 把偏差映射成 0–100 分，并用 FFLogs 同款渐变色带着色。
-///
-/// 分数越高 = 这波直暴越欧；越低 = 越非酋。
-/// 当面板数据暂不可用时，回退为用会话内观测到的边际暴击/直击率估算（降级，仅供参考）。
+/// 现在以<b>玩家自己的历史平均直暴率</b>（跨所有战斗累计，见 CombatTracker.GetLuckBaselineCdRate）
+/// 作为零假设：本场/本技能的直暴率相对自己常态偏高=欧、偏低=非酋。
+/// 比较"实际直暴次数"与"期望直暴次数(=命中×个人基线直暴率)"的偏差（二项分布标准差为单位），
+/// 映射成 0–100 分，并用 FFLogs 同款渐变色带着色。分数越高越欧。
+/// 尚无个人历史时（首场/无数据）回退用面板理论值，仅作降级展示。
 /// </summary>
 public static class LuckRating
 {
@@ -30,21 +31,14 @@ public static class LuckRating
     /// 计算直暴运气分数（0–100）。
     /// </summary>
     /// <param name="hits">命中次数（分母）。</param>
-    /// <param name="crit">暴击次数（含直暴）。</param>
-    /// <param name="directHit">直击次数（含直暴）。</param>
-    /// <param name="critDirect">直暴（暴击且直击）次数。</param>
-    /// <param name="pCrit">理论暴击率(0–1)，≤0 时用观测边际率回退。</param>
-    /// <param name="pDh">理论直击率(0–1)，≤0 时用观测边际率回退。</param>
-    public static double ComputeScore(long hits, long crit, long directHit, long critDirect,
-        double pCrit = 0, double pDh = 0)
+    /// <param name="critDirect">直暴（暴击且直击）次数（分子）。</param>
+    /// <param name="expectedCdRate">期望直暴率(0–1)，即「个人历史基线直暴率」；≤0 时回退为中性 50。</param>
+    public static double ComputeScore(long hits, long critDirect, double expectedCdRate)
     {
         if (hits <= 0)
             return 50;
 
-        double useCrit = pCrit > 0 ? pCrit : (double)crit / hits;
-        double useDh = pDh > 0 ? pDh : (double)directHit / hits;
-
-        double pCd = useCrit * useDh;
+        double pCd = expectedCdRate;
         if (pCd <= 0)
             return 50;
 
@@ -63,12 +57,12 @@ public static class LuckRating
         return Math.Clamp(score, 0, 100);
     }
 
-    /// <summary>理论期望直暴次数（用于 UI 展示 期望 vs 实际）。</summary>
-    public static double ExpectedCritDirect(long hits, double pCrit, double pDh)
+    /// <summary>期望直暴次数（用于 UI 展示 期望 vs 实际）。</summary>
+    public static double ExpectedCritDirect(long hits, double expectedCdRate)
     {
-        if (hits <= 0 || pCrit <= 0 || pDh <= 0)
+        if (hits <= 0 || expectedCdRate <= 0)
             return 0;
-        return hits * pCrit * pDh;
+        return hits * expectedCdRate;
     }
 
     /// <summary>分数 → FFLogs 风格颜色（ImGui 的 uint 格式 0xAABBGGRR）。</summary>
