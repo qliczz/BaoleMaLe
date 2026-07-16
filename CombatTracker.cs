@@ -360,7 +360,7 @@ public unsafe class CombatTracker : IDisposable
                 if (isDh) dh++;
                 if (isCd) cd++;
 
-                var dmg = (uint)eff.Value;
+                var dmg = DecodeDamage(eff);
                 dmgCount++;
                 dmgSum += dmg;
                 if (dmg > dmgMax) dmgMax = dmg;
@@ -411,7 +411,7 @@ public unsafe class CombatTracker : IDisposable
 
     /// <summary>
     /// 记录一次「出手」（无论是否造成伤害），用于「旋转教练」的技能序列分析。
-    /// 通过引擎下发的 AnimationLock 粗判 GCD/能力：值越大越可能是 GCD（复唱锁）。
+    /// 使用 Action 表的公共复唱组判定 GCD；动画锁仅保留作诊断数据。
     /// </summary>
     private void RecordCast(uint casterEntityId, ActionEffectHandler.Header* header)
     {
@@ -419,7 +419,16 @@ public unsafe class CombatTracker : IDisposable
             return;
         var castMs = (uint)(DateTime.Now - this.battleStart).TotalMilliseconds;
         float animLock = header->AnimationLock;
-        bool isGcd = animLock >= 1.2f;
+        bool isGcd = false;
+        try
+        {
+            var action = this.dataManager.GetExcelSheet<Action>()?.GetRow(header->ActionId);
+            isGcd = action != null && action.Value.CooldownGroup == 58;
+        }
+        catch
+        {
+            // 表查询失败时仍保留出手，不把动画锁误当作复唱组。
+        }
         lock (this.lockObj)
         {
             if (!this.actionLog.ContainsKey(casterEntityId))
@@ -465,6 +474,10 @@ public unsafe class CombatTracker : IDisposable
             }
         }
     }
+
+    /// <summary>ActionEffect 的 16 位 Value 在 Param4 bit 0x40 置位时由 Param3 提供高 16 位。</summary>
+    internal static uint DecodeDamage(ActionEffectHandler.Effect effect)
+        => effect.Value + ((effect.Param4 & 0x40) != 0 ? (uint)effect.Param3 << 16 : 0u);
 
     private ActorStat EnsureActor(uint entityId)
     {
@@ -828,6 +841,62 @@ public unsafe class CombatTracker : IDisposable
         Skills = a.Skills.ToDictionary(kv => kv.Key, kv => Clone(kv.Value)),
     };
 
+    private static BattleRecord CloneBattle(BattleRecord source) => new()
+    {
+        Id = source.Id,
+        StartedUnix = source.StartedUnix,
+        EndedUnix = source.EndedUnix,
+        JobId = source.JobId,
+        JobName = source.JobName,
+        ZoneName = source.ZoneName,
+        CritRatePct = source.CritRatePct,
+        DhRatePct = source.DhRatePct,
+        Skills = source.Skills.ToDictionary(kv => kv.Key, kv => Clone(kv.Value)),
+        Actors = source.Actors?.ToDictionary(kv => kv.Key, kv => CloneActor(kv.Value)),
+        Timeline = source.Timeline?.Select(e => new DamageEvent
+        {
+            TimeMs = e.TimeMs,
+            ActorEntityId = e.ActorEntityId,
+            ActionId = e.ActionId,
+            TargetEntityId = e.TargetEntityId,
+            Damage = e.Damage,
+            Crit = e.Crit,
+            DirectHit = e.DirectHit,
+            CritDirect = e.CritDirect,
+        }).ToList(),
+        Targets = source.Targets?.ToDictionary(kv => kv.Key, kv => new TargetStat
+        {
+            TargetEntityId = kv.Value.TargetEntityId,
+            TargetName = kv.Value.TargetName,
+            DamageTaken = kv.Value.DamageTaken,
+            Hits = kv.Value.Hits,
+            MaxHit = kv.Value.MaxHit,
+            ByActor = new Dictionary<uint, ulong>(kv.Value.ByActor),
+        }),
+        Buffs = source.Buffs?.Select(b => new BuffWindow
+        {
+            ActorEntityId = b.ActorEntityId,
+            SourceEntityId = b.SourceEntityId,
+            StatusId = b.StatusId,
+            StatusName = b.StatusName,
+            StartMs = b.StartMs,
+            EndMs = b.EndMs,
+        }).ToList(),
+        ActionLog = source.ActionLog?.ToDictionary(
+            kv => kv.Key,
+            kv => kv.Value.Select(c => new ActionCast
+            {
+                TimeMs = c.TimeMs,
+                ActionId = c.ActionId,
+                AnimLock = c.AnimLock,
+                IsGcd = c.IsGcd,
+            }).ToList()),
+        DurationSec = source.DurationSec,
+        ActorRdps = source.ActorRdps == null ? null : new Dictionary<uint, double>(source.ActorRdps),
+        Commentary = source.Commentary,
+        BattleLuck = source.BattleLuck,
+    };
+
     private string LookupJobName(byte jobId)
     {
         try
@@ -909,9 +978,8 @@ public unsafe class CombatTracker : IDisposable
         {
             Directory.CreateDirectory(this.configDir);
             List<BattleRecord> copy;
-            lock (this.lockObj) copy = this.history.ToList();
-            File.WriteAllText(Path.Combine(this.configDir, "history.json"),
-                JsonConvert.SerializeObject(copy, Formatting.Indented));
+            lock (this.lockObj) copy = this.history.Select(CloneBattle).ToList();
+            WriteJsonAtomically(Path.Combine(this.configDir, "history.json"), copy);
         }
         catch (Exception ex)
         {
@@ -926,9 +994,14 @@ public unsafe class CombatTracker : IDisposable
             Directory.CreateDirectory(this.configDir);
             TotalsStore store;
             lock (this.lockObj)
-                store = new TotalsStore { GrandTotals = this.grandTotals, JobTotals = this.jobTotals };
-            File.WriteAllText(Path.Combine(this.configDir, "totals.json"),
-                JsonConvert.SerializeObject(store, Formatting.Indented));
+                store = new TotalsStore
+                {
+                    GrandTotals = this.grandTotals.ToDictionary(kv => kv.Key, kv => Clone(kv.Value)),
+                    JobTotals = this.jobTotals.ToDictionary(
+                        job => job.Key,
+                        job => job.Value.ToDictionary(kv => kv.Key, kv => Clone(kv.Value))),
+                };
+            WriteJsonAtomically(Path.Combine(this.configDir, "totals.json"), store);
         }
         catch (Exception ex)
         {
@@ -940,6 +1013,13 @@ public unsafe class CombatTracker : IDisposable
     {
         SaveHistory();
         SaveTotals();
+    }
+
+    private static void WriteJsonAtomically(string path, object value)
+    {
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, JsonConvert.SerializeObject(value, Formatting.Indented));
+        File.Move(temp, path, true);
     }
 
     private sealed class TotalsStore

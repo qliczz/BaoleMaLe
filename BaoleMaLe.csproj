@@ -3,7 +3,7 @@
   <!-- Project settings -->
   <PropertyGroup>
     <Name>Is that a crit？</Name>
-    <Version>0.4.3.2</Version>
+    <Version>0.4.3.3</Version>
     <Author>斯温</Author>
     <RepoUrl>https://github.com/qliczz/BaoleMaLe</RepoUrl>
     <Punchline>Is that a crit？</Punchline>
@@ -14,7 +14,7 @@
 
   <!-- Build settings -->
   <PropertyGroup>
-    <OutputPath>..\bin\</OutputPath>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
@@ -25,4 +25,7 @@
   <PropertyGroup>
     <Use_Dalamud_FFXIVClientStructs>true</Use_Dalamud_FFXIVClientStructs>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
 </Project>
