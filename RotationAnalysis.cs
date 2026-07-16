@@ -5,15 +5,12 @@ using System.Linq;
 using Dalamud.Plugin.Services;
 using Lumina.Excel.Sheets;
 
-/// <summary>旋转教练：一次待改进提示。</summary>
 public sealed class RotationIssue
 {
     public double AtSec;
-    public string Kind = "";   // "idle" | "clip"
+    public string Kind = "";
     public string Detail = "";
 }
-
-/// <summary>旋转教练：单个成员的分析报告。</summary>
 public sealed class RotationReport
 {
     public uint ActorId;
@@ -22,7 +19,7 @@ public sealed class RotationReport
     public int OgcdCount;
     public double DurationSec;
     public double Apm;
-    public double GcdCadenceSec;   // GCD 之间的中位间隔（秒）
+    public double GcdCadenceSec;
     public double IdleSec;
     public double IdlePct;
     public int IdleGaps;
@@ -32,15 +29,13 @@ public sealed class RotationReport
 }
 
 /// <summary>
-/// 旋转分析层（v0.4.4）。
-/// 输入：按成员聚合的出手序列（时间 + 技能ID + 是否GCD）。
-/// 输出：APM、GCD 节奏、发呆统计，以及「发呆段 / 疑似卡手」待改进列表。
-/// 说明：GCD 判定依赖引擎下发的 AnimationLock 粗判，属启发式；发呆/APM 等不依赖该判定，始终可靠。
+/// 输入出手序列，输出 APM、GCD 节奏以及 GCD 延迟估算。
+/// GCD 由 Action 表公共复唱组判定；卡手与停顿只累计超出正常复唱的部分。
 /// </summary>
 public static class RotationAnalysis
 {
-    /// <summary>发呆阈值：相邻出手间隔超过该秒数即记为一段发呆。</summary>
-    public const double IdleThresholdSec = 2.0;
+    public const double ClipToleranceSec = 0.15;
+    public const double MinDowntimeThresholdSec = 4.0;
 
     public static RotationReport Analyze(Dictionary<uint, List<ActionCast>>? log, uint focus, double durSec, IDataManager dm)
     {
@@ -53,68 +48,72 @@ public static class RotationAnalysis
         rep.TotalActions = sorted.Count;
         rep.GcdCount = sorted.Count(a => a.IsGcd);
         rep.OgcdCount = sorted.Count - rep.GcdCount;
-        double dur = rep.DurationSec;
-        rep.Apm = dur > 0 ? rep.TotalActions / (dur / 60.0) : 0;
+        rep.Apm = rep.TotalActions / (rep.DurationSec / 60.0);
 
-        // GCD 节奏 = GCD 之间间隔的中位数
         var gcdTimes = sorted.Where(a => a.IsGcd).Select(a => a.TimeMs).ToList();
-        if (gcdTimes.Count >= 2)
+        var intervals = new List<double>();
+        for (var i = 1; i < gcdTimes.Count; i++)
+            intervals.Add((gcdTimes[i] - gcdTimes[i - 1]) / 1000.0);
+
+        var active = intervals.Where(x => x >= 0.8 && x <= 4.0).OrderBy(x => x).ToList();
+        if (active.Count > 0)
         {
-            var intervals = new List<double>();
-            for (int i = 1; i < gcdTimes.Count; i++)
-                intervals.Add((gcdTimes[i] - gcdTimes[i - 1]) / 1000.0);
-            intervals.Sort();
-            rep.GcdCadenceSec = intervals[intervals.Count / 2];
+            var lowerHalf = active.Take(Math.Max(1, (active.Count + 1) / 2)).ToList();
+            rep.GcdCadenceSec = Median(lowerHalf);
         }
 
-        // 发呆检测：相邻出手间隔过大
-        double idle = 0;
-        int gaps = 0;
-        double longest = 0;
-        for (int i = 1; i < sorted.Count; i++)
+        var idle = 0.0;
+        var gaps = 0;
+        var longest = 0.0;
+        if (rep.GcdCadenceSec > 0)
         {
-            double gap = (sorted[i].TimeMs - sorted[i - 1].TimeMs) / 1000.0;
-            if (gap > IdleThresholdSec)
+            var downtimeThreshold = Math.Max(MinDowntimeThresholdSec, rep.GcdCadenceSec * 1.8);
+            for (var i = 0; i < intervals.Count; i++)
             {
-                idle += gap;
-                gaps++;
-                if (gap > longest) longest = gap;
-                rep.Issues.Add(new RotationIssue
+                var gap = intervals[i];
+                var atSec = gcdTimes[i + 1] / 1000.0;
+                var excess = Math.Max(0, gap - rep.GcdCadenceSec);
+
+                if (gap >= downtimeThreshold)
                 {
-                    AtSec = sorted[i - 1].TimeMs / 1000.0,
-                    Kind = "idle",
-                    Detail = $"{(sorted[i - 1].TimeMs / 1000.0):F1}s 后停顿 {gap:F1}s 才出手（已 {gaps} 段发呆）",
-                });
-            }
-        }
-        rep.IdleSec = idle;
-        rep.IdlePct = dur > 0 ? idle / dur * 100.0 : 0;
-        rep.IdleGaps = gaps;
-        rep.LongestIdleSec = longest;
-
-        // 疑似卡手：GCD 间隔远低于常态（< 60% 中位节奏且 < 1s）
-        if (gcdTimes.Count >= 3 && rep.GcdCadenceSec > 0)
-        {
-            for (int i = 1; i < gcdTimes.Count; i++)
-            {
-                double iv = (gcdTimes[i] - gcdTimes[i - 1]) / 1000.0;
-                if (iv < rep.GcdCadenceSec * 0.6 && iv < 1.0)
+                    idle += excess;
+                    gaps++;
+                    longest = Math.Max(longest, excess);
+                    rep.Issues.Add(new RotationIssue
+                    {
+                        AtSec = atSec,
+                        Kind = "idle",
+                        Detail = $"{atSec:F1}s 的 GCD 间隔为 {gap:F2}s，估计少打/停顿 {excess:F2}s",
+                    });
+                }
+                else if (excess > ClipToleranceSec)
                 {
                     rep.Issues.Add(new RotationIssue
                     {
-                        AtSec = gcdTimes[i] / 1000.0,
+                        AtSec = atSec,
                         Kind = "clip",
-                        Detail = $"{(gcdTimes[i] / 1000.0):F1}s 处 GCD 间隔仅 {iv:F2}s，疑似卡手/提前（常态 {rep.GcdCadenceSec:F2}s）",
+                        Detail = $"{atSec:F1}s 的 GCD 比基准晚 {excess:F2}s（{gap:F2}s / 基准 {rep.GcdCadenceSec:F2}s）",
                     });
                 }
             }
         }
 
+        rep.IdleSec = idle;
+        rep.IdlePct = Math.Min(100, idle / rep.DurationSec * 100.0);
+        rep.IdleGaps = gaps;
+        rep.LongestIdleSec = longest;
         rep.Issues = rep.Issues.OrderBy(x => x.AtSec).ToList();
         return rep;
     }
 
-    /// <summary>查技能中文名（Lumina Action 表）。查不到回退为「技能{id}」。</summary>
+    private static double Median(List<double> sorted)
+    {
+        var middle = sorted.Count / 2;
+        return sorted.Count % 2 == 0
+            ? (sorted[middle - 1] + sorted[middle]) / 2.0
+            : sorted[middle];
+    }
+
     public static string ActionName(uint id, IDataManager dm)
     {
         try
@@ -122,12 +121,15 @@ public static class RotationAnalysis
             var row = dm.GetExcelSheet<Action>()?.GetRow(id);
             if (row != null)
             {
-                var n = row.Value.Name.ToString();
-                if (!string.IsNullOrWhiteSpace(n))
-                    return n;
+                var name = row.Value.Name.ToString();
+                if (!string.IsNullOrWhiteSpace(name))
+                    return name;
             }
         }
-        catch { }
+        catch
+        {
+        }
+
         return id == 0 ? "(无)" : $"技能{id}";
     }
 }

@@ -1,8 +1,8 @@
 {
   "Name": "Is that a crit？",
   "InternalName": "BaoleMaLe",
-  "AssemblyVersion": "0.2.0.0",
-  "TestingAssemblyVersion": "0.2.0.0",
+  "AssemblyVersion": "0.4.3.3",
+  "TestingAssemblyVersion": "0.4.3.3",
   "DalamudApiLevel": 15,
   "Author": "斯温",
   "Description": "统计玩家打出的伤害技能的直暴运气，按角色面板理论几率评分，并自动分段记录每场战斗、分职业统计。",
@@ -10,5 +10,5 @@
   "DownloadLinkInstall": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
   "DownloadLinkUpdate": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
   "DownloadLinkTesting": "https://github.com/qliczz/BaoleMaLe/releases/download/v0.2.0.0/BaoleMaLe.zip",
-  "Changelog": "v0.2.0.0: rename Is that a crit？; auto panel crit/dh rates; per-job stats; battle history library."
+  "Changelog": "v0.4.3.3：修正扩展伤害解码、GCD 延迟分析与原子持久化。"
 }

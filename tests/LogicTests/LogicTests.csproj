@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>BaoleMaLe.LogicTests</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows7.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\BaoleMaLe.csproj" />
+    <Reference Include="FFXIVClientStructs" HintPath="$(DALAMUD_HOME)\FFXIVClientStructs.dll" />
+  </ItemGroup>
+</Project>
