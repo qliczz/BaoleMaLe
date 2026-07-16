@@ -3,42 +3,24 @@ namespace BaoleMaLe;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using GameObjectId = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectId;
 using Dalamud.Plugin.Services;
+using Dalamud.Game.ClientState.Party;
+using Dalamud.Game.ClientState.Objects.Types;
 using Newtonsoft.Json;
 using System.IO;
 using Lumina.Excel.Sheets;
 
-/// <summary>
-/// 单个技能（动作）的累计统计。
-/// </summary>
+/// <summary>单个技能（动作）的累计统计。</summary>
 public sealed class SkillStat
 {
     public uint ActionId;
-
-    /// <summary>释放次数：本地玩家施放该伤害技能的次数（一次 Receive 调用计 1 次）。</summary>
     public long Casts;
-
-    /// <summary>命中次数：造成实际伤害(Effect.Type==0x03)的效果条目数（多段/AoE 会 &gt; 释放次数）。</summary>
     public long Hits;
-
-    /// <summary>暴击次数（含直暴）。</summary>
     public long Crit;
-
-    /// <summary>直击次数（含直暴）。</summary>
     public long DirectHit;
-
-    /// <summary>直暴（暴击且直击）次数。</summary>
     public long CritDirect;
-
-    /// <summary>伤害总和（所有命中造成的伤害累加）。</summary>
     public ulong DamageSum;
-
-    /// <summary>单次命中造成的最高伤害。</summary>
     public uint DamageMax;
-
-    /// <summary>单次命中造成的最低伤害（初始为 uint.MaxValue，便于取 min）。</summary>
     public uint DamageMin = uint.MaxValue;
-
-    /// <summary>记录到伤害的次数（等于 DamageSum 的取样数）。</summary>
     public uint DamageCount;
 
     [JsonIgnore]
@@ -51,9 +33,16 @@ public sealed class SkillStat
     public double AvgDamage => DamageCount > 0 ? (double)DamageSum / DamageCount : 0;
 }
 
-/// <summary>
-/// 一场已结束（或正在进行）的战斗记录，可序列化落盘，构成"数据浏览库"。
-/// </summary>
+/// <summary>一次出手记录（用于「旋转教练」：记录玩家实际按下的技能序列）。</summary>
+public sealed class ActionCast
+{
+    public uint TimeMs;
+    public uint ActionId;
+    public float AnimLock;   // 引擎下发的动画锁（秒，约 = 复唱时间；GCD≈2.5，能力≈0.6）
+    public bool IsGcd;
+}
+
+/// <summary>一场已结束（或正在进行）的战斗记录，可序列化落盘。</summary>
 public sealed class BattleRecord
 {
     public string Id = "";
@@ -61,25 +50,27 @@ public sealed class BattleRecord
     public long EndedUnix;
     public byte JobId;
     public string JobName = "";
-    /// <summary>战斗发生的场地名（副本名 / 地图名），开场时从 TerritoryType 读取。</summary>
     public string ZoneName = "";
-    /// <summary>开场时从角色面板读取的理论暴击率（%，0–100）。</summary>
     public double CritRatePct;
-    /// <summary>开场时从角色面板读取的理论直击率（%，0–100）。</summary>
     public double DhRatePct;
+
+    /// <summary>本地玩家（原"统计"页）的技能统计，保留以兼容暴击/运气功能。</summary>
     public Dictionary<uint, SkillStat> Skills = new();
-    /// <summary>整场战斗的直暴运气评分（0–100），结束时计算并缓存。</summary>
+
+    // ---------- v0.4 新增：本队全员 / 时间轴 / 多目标 / BUFF ----------
+    public Dictionary<uint, ActorStat>? Actors = new();
+    public List<DamageEvent>? Timeline = new();
+    public Dictionary<uint, TargetStat>? Targets = new();
+    public List<BuffWindow>? Buffs = new();
+    // ---------- v0.4.4 新增：旋转教练出手日志 ----------
+    public Dictionary<uint, List<ActionCast>>? ActionLog = new();
+    public double? DurationSec;
+    public Dictionary<uint, double>? ActorRdps;
+    public string? Commentary;
+
     public double? BattleLuck;
 }
 
-/// <summary>
-/// 战斗统计核心：
-///  - 钩住 ActionEffectHandler.Receive（7.x 战斗效果入口）采集本地玩家的伤害技能数据；
-///  - 监听 Character.InCombat 自动把数据分段成"一场场战斗"；
-///  - 同时维护 总计数（全职业累计）、分职业计数、以及最近 N 场战斗的历史库（落盘）。
-///
-/// 7.x 效果编码：每条 Effect 8 字节，Type==0x03 为伤害，Param0 严重度 0x20=暴击 / 0x40=直击 / 0x60=直暴。
-/// </summary>
 public unsafe class CombatTracker : IDisposable
 {
     private const string ReceiveSig =
@@ -88,8 +79,6 @@ public unsafe class CombatTracker : IDisposable
     private const byte TypeDamage = 0x03;
     private const byte SeverityCrit = 0x20;
     private const byte SeverityDirect = 0x40;
-
-    // 连续脱战超过该秒数，判定当前战斗结束。
     private const int CombatGraceSeconds = 8;
 
     private readonly IGameInteropProvider interop;
@@ -98,6 +87,7 @@ public unsafe class CombatTracker : IDisposable
     private readonly IDataManager dataManager;
     private readonly IPluginLog log;
     private readonly string configDir;
+    private readonly IPartyList? partyList;
     private int maxBattles;
 
     private Hook<ReceiveDelegate>? hook;
@@ -111,7 +101,22 @@ public unsafe class CombatTracker : IDisposable
     private DateTime lastCombatTime = DateTime.MinValue;
     private int diagCount;
 
+    // v0.4 本队采集状态
+    private readonly HashSet<uint> partySet = new();
+    private DateTime battleStart = DateTime.MinValue;
+    private List<DamageEvent> timeline = new();
+    private Dictionary<uint, List<ActionCast>> actionLog = new();
+    private Dictionary<uint, TargetStat> targets = new();
+    private List<BuffWindow> buffWindows = new();
+    private readonly Dictionary<uint, List<ActiveBuff>> activeBuffs = new();
+    private DateTime lastBuffPoll = DateTime.MinValue;
+    private DateTime lastPartyRefresh = DateTime.MinValue;
+
     public bool IsTrackingEnabled { get; set; } = true;
+    public bool EnablePartyMeter { get; set; } = true;
+    public bool TrackBuffs { get; set; } = true;
+    public double RdpsAttribution { get; set; } = 1.0;
+    public int TimelineMaxEvents { get; set; } = 20000;
 
     private unsafe delegate void ReceiveDelegate(
         uint casterEntityId,
@@ -122,7 +127,8 @@ public unsafe class CombatTracker : IDisposable
         GameObjectId* targetEntityIds);
 
     public CombatTracker(IGameInteropProvider interop, ISigScanner sigScanner,
-        IObjectTable objects, IDataManager dataManager, IPluginLog log, string configDir, int maxBattles)
+        IObjectTable objects, IDataManager dataManager, IPluginLog log, string configDir,
+        int maxBattles, IPartyList? partyList)
     {
         this.interop = interop;
         this.sigScanner = sigScanner;
@@ -130,6 +136,7 @@ public unsafe class CombatTracker : IDisposable
         this.dataManager = dataManager;
         this.log = log;
         this.configDir = configDir;
+        this.partyList = partyList;
         this.maxBattles = Math.Max(1, maxBattles);
         LoadAll();
     }
@@ -158,7 +165,6 @@ public unsafe class CombatTracker : IDisposable
         this.hook = null;
     }
 
-    /// <summary>每帧由 Plugin 的 Framework tick 调用，负责自动开/关战斗分段。</summary>
     public void Tick()
     {
         bool inCombat;
@@ -180,6 +186,21 @@ public unsafe class CombatTracker : IDisposable
         else if (!inCombat && this.current != null &&
                  (DateTime.Now - this.lastCombatTime).TotalSeconds > CombatGraceSeconds)
             EndSession();
+
+        // 周期刷新本队集合 + 轮询 BUFF
+        if (this.current != null)
+        {
+            if ((DateTime.Now - this.lastPartyRefresh).TotalSeconds > 3)
+            {
+                this.lastPartyRefresh = DateTime.Now;
+                RefreshParty(addOnly: true);
+            }
+            if (this.TrackBuffs && (DateTime.Now - this.lastBuffPoll).TotalMilliseconds > 250)
+            {
+                this.lastBuffPoll = DateTime.Now;
+                PollBuffs();
+            }
+        }
     }
 
     private void StartSession()
@@ -197,7 +218,18 @@ public unsafe class CombatTracker : IDisposable
             ZoneName = zoneName,
             CritRatePct = crit * 100.0,
             DhRatePct = dh * 100.0,
+            Actors = new Dictionary<uint, ActorStat>(),
+            Timeline = new List<DamageEvent>(),
+            Targets = new Dictionary<uint, TargetStat>(),
+            Buffs = new List<BuffWindow>(),
         };
+        this.battleStart = DateTime.Now;
+        this.timeline = this.current.Timeline;
+        this.actionLog = this.current.ActionLog!;
+        this.targets = this.current.Targets;
+        this.buffWindows = this.current.Buffs;
+        this.activeBuffs.Clear();
+        RefreshParty(addOnly: false);
         this.log.Info($"[Is that a crit？] 开始记录战斗：{jobName} @ {zoneName}（理论暴击 {crit * 100:F1}% / 直击 {dh * 100:F1}%）");
     }
 
@@ -209,7 +241,38 @@ public unsafe class CombatTracker : IDisposable
             return;
 
         rec.EndedUnix = DateTimeOffset.Now.ToUnixTimeSeconds();
+        rec.DurationSec = Math.Max(1, rec.EndedUnix - rec.StartedUnix);
         rec.BattleLuck = ComputeBattleLuck(rec);
+
+        // 收尾 BUFF 窗口
+        if (this.TrackBuffs)
+        {
+            var endMs = (uint)(DateTime.Now - this.battleStart).TotalMilliseconds;
+            foreach (var kv in this.activeBuffs)
+                foreach (var ab in kv.Value)
+                {
+                    var w = this.buffWindows.LastOrDefault(b =>
+                        b.ActorEntityId == kv.Key && b.SourceEntityId == ab.SourceId &&
+                        b.StatusId == ab.StatusId && b.EndMs == ab.StartMs);
+                    if (w != null) w.EndMs = endMs;
+                }
+            this.activeBuffs.Clear();
+        }
+
+        // 近似 rDPS
+        if (this.EnablePartyMeter && rec.Actors != null)
+        {
+            try
+            {
+                rec.ActorRdps = BattleAnalysis.ComputeRdps(
+                    rec.Timeline ?? new List<DamageEvent>(),
+                    rec.Buffs ?? new List<BuffWindow>(),
+                    rec.Actors, rec.DurationSec.Value, this.RdpsAttribution);
+            }
+            catch { rec.ActorRdps = null; }
+            try { rec.Commentary = BattleAnalysis.GenerateCommentary(rec); }
+            catch { rec.Commentary = ""; }
+        }
 
         lock (this.lockObj)
         {
@@ -219,7 +282,7 @@ public unsafe class CombatTracker : IDisposable
         }
         SaveHistory();
         SaveTotals();
-        this.log.Info($"[Is that a crit？] 战斗结束：{rec.JobName}，技能 {rec.Skills.Count} 种，运气 {rec.BattleLuck:F0}");
+        this.log.Info($"[Is that a crit？] 战斗结束：{rec.JobName}，技能 {rec.Skills.Count} 种，队员 {rec.Actors?.Count ?? 0} 人，运气 {rec.BattleLuck:F0}");
     }
 
     private void Detour(uint casterEntityId, Character* casterPtr, Vector3* targetPos,
@@ -228,21 +291,26 @@ public unsafe class CombatTracker : IDisposable
         try
         {
             var local = this.objects.LocalPlayer;
-            var localAddr = local?.Address ?? nint.Zero;
+            var localId = local?.EntityId ?? 0u;
 
-            if (this.diagCount < 20)
+            if (this.diagCount < 10)
             {
                 this.diagCount++;
-                var match = localAddr != nint.Zero && (nint)casterPtr == localAddr;
+                bool inParty = this.partySet.Contains(casterEntityId);
                 var actionId = header != null ? header->ActionId : 0u;
-                var numT = header != null ? header->NumTargets : (byte)0;
-                this.log.Info($"[Is that a crit？][诊断] Receive #{this.diagCount} caster={casterEntityId} match={match} action={actionId} numTargets={numT}");
+                this.log.Info($"[Is that a crit？][诊断] Receive #{this.diagCount} caster={casterEntityId} inParty={inParty} local={localId} action={actionId}");
             }
 
-            if (this.IsTrackingEnabled && localAddr != nint.Zero && casterPtr != null &&
-                header != null && effects != null && (nint)casterPtr == localAddr)
+            if (this.IsTrackingEnabled && header != null && effects != null && targetEntityIds != null)
             {
-                RecordEffects(header, effects);
+                bool shouldProcess = this.EnablePartyMeter
+                    ? this.partySet.Contains(casterEntityId)
+                    : (casterEntityId == localId);
+                if (shouldProcess)
+                {
+                    RecordCast(casterEntityId, header);
+                    RecordEffectsForActor(casterEntityId, header, effects, targetEntityIds);
+                }
             }
         }
         catch (Exception ex)
@@ -255,8 +323,10 @@ public unsafe class CombatTracker : IDisposable
         }
     }
 
-    private void RecordEffects(ActionEffectHandler.Header* header, ActionEffectHandler.TargetEffects* effects)
+    private void RecordEffectsForActor(uint casterEntityId, ActionEffectHandler.Header* header,
+        ActionEffectHandler.TargetEffects* effects, GameObjectId* targetEntityIds)
     {
+        var actor = EnsureActor(casterEntityId);
         var actionId = header->ActionId;
         if (actionId == 0)
             return;
@@ -266,12 +336,14 @@ public unsafe class CombatTracker : IDisposable
             return;
 
         var allEffects = (ActionEffectHandler.Effect*)effects;
-
         long hits = 0, crit = 0, dh = 0, cd = 0;
         ulong dmgSum = 0;
         uint dmgMax = 0;
         uint dmgMin = uint.MaxValue;
         uint dmgCount = 0;
+
+        var battleMs = (uint)(DateTime.Now - this.battleStart).TotalMilliseconds;
+
         for (var t = 0; t < numTargets; t++)
         {
             for (var e = 0; e < 8; e++)
@@ -281,41 +353,256 @@ public unsafe class CombatTracker : IDisposable
                     continue;
                 hits++;
                 var sev = eff.Param0;
-                if ((sev & SeverityCrit) != 0) crit++;
-                if ((sev & SeverityDirect) != 0) dh++;
-                if ((sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect)) cd++;
+                bool isCrit = (sev & SeverityCrit) != 0;
+                bool isDh = (sev & SeverityDirect) != 0;
+                bool isCd = (sev & (SeverityCrit | SeverityDirect)) == (SeverityCrit | SeverityDirect);
+                if (isCrit) crit++;
+                if (isDh) dh++;
+                if (isCd) cd++;
 
-                // 7.x 伤害数值存放在 Effect.Value（offset 6，ushort）。
                 var dmg = (uint)eff.Value;
                 dmgCount++;
                 dmgSum += dmg;
                 if (dmg > dmgMax) dmgMax = dmg;
                 if (dmg < dmgMin) dmgMin = dmg;
+
+                // 目标与多目标统计
+                uint tid = (uint)targetEntityIds[t];
+                RecordTarget(tid, dmg, casterEntityId);
+
+                // 时间轴事件
+                if (this.timeline.Count < this.TimelineMaxEvents)
+                {
+                    this.timeline.Add(new DamageEvent
+                    {
+                        TimeMs = battleMs,
+                        ActorEntityId = casterEntityId,
+                        ActionId = actionId,
+                        TargetEntityId = tid,
+                        Damage = dmg,
+                        Crit = isCrit,
+                        DirectHit = isDh,
+                        CritDirect = isCd,
+                    });
+                }
             }
         }
 
         if (hits == 0)
             return;
 
-        var jobId = this.current?.JobId ?? PlayerStats.GetCurrentClassJobId();
-        var hasLocalDetail = false;
+        // 计入该队员的技能统计
+        lock (this.lockObj)
+        {
+            MergeInto(actor.Skills, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
+            // 本地玩家同时维护原"统计"页数据（暴击/运气）
+            if (actor.IsLocal)
+            {
+                var jobId = actor.JobId;
+                MergeInto(this.grandTotals, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
+                if (!this.jobTotals.ContainsKey(jobId))
+                    this.jobTotals[jobId] = new Dictionary<uint, SkillStat>();
+                MergeInto(this.jobTotals[jobId], actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
+                if (this.current != null)
+                    MergeInto(this.current.Skills, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 记录一次「出手」（无论是否造成伤害），用于「旋转教练」的技能序列分析。
+    /// 通过引擎下发的 AnimationLock 粗判 GCD/能力：值越大越可能是 GCD（复唱锁）。
+    /// </summary>
+    private void RecordCast(uint casterEntityId, ActionEffectHandler.Header* header)
+    {
+        if (header->ActionId == 0)
+            return;
+        var castMs = (uint)(DateTime.Now - this.battleStart).TotalMilliseconds;
+        float animLock = header->AnimationLock;
+        bool isGcd = animLock >= 1.2f;
+        lock (this.lockObj)
+        {
+            if (!this.actionLog.ContainsKey(casterEntityId))
+                this.actionLog[casterEntityId] = new List<ActionCast>();
+            var lst = this.actionLog[casterEntityId];
+            if (lst.Count < this.TimelineMaxEvents)
+                lst.Add(new ActionCast { TimeMs = castMs, ActionId = header->ActionId, AnimLock = animLock, IsGcd = isGcd });
+        }
+    }
+
+    private void RecordTarget(uint tid, uint dmg, uint actorEntityId)
+    {
+        if (tid == 0 || dmg == 0)
+            return;
+        string tname;
+        try
+        {
+            var obj = this.objects.SearchByEntityId(tid);
+            tname = obj?.Name.ToString() ?? $"目标 {tid}";
+        }
+        catch { tname = $"目标 {tid}"; }
 
         lock (this.lockObj)
         {
-            MergeInto(this.grandTotals, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
-            if (!this.jobTotals.ContainsKey(jobId))
-                this.jobTotals[jobId] = new Dictionary<uint, SkillStat>();
-            MergeInto(this.jobTotals[jobId], actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
-            if (this.current != null)
+            TargetStat? ts = null;
+            if (this.targets != null)
             {
-                MergeInto(this.current.Skills, actionId, hits, crit, dh, cd, dmgSum, dmgMax, dmgMin, dmgCount);
-                hasLocalDetail = this.current.Skills.Count <= 1;
+                if (!this.targets.TryGetValue(tid, out ts))
+                {
+                    ts = new TargetStat { TargetEntityId = tid, TargetName = tname };
+                    this.targets[tid] = ts;
+                }
+                else if (string.IsNullOrEmpty(ts.TargetName) || ts.TargetName == $"目标 {tid}")
+                {
+                    ts.TargetName = tname;
+                }
+                ts.DamageTaken += dmg;
+                ts.Hits++;
+                if (dmg > ts.MaxHit) ts.MaxHit = dmg;
+                if (!ts.ByActor.ContainsKey(actorEntityId))
+                    ts.ByActor[actorEntityId] = 0;
+                ts.ByActor[actorEntityId] += dmg;
+            }
+        }
+    }
+
+    private ActorStat EnsureActor(uint entityId)
+    {
+        lock (this.lockObj)
+        {
+            if (this.current != null && this.current.Actors != null &&
+                this.current.Actors.TryGetValue(entityId, out var existing))
+                return existing;
+        }
+
+        string name = "玩家"; byte jobId = 0; string jobName = ""; bool isLocal = false;
+        try
+        {
+            var obj = this.objects.SearchByEntityId(entityId);
+            if (obj != null)
+            {
+                name = obj.Name.ToString();
+                var ch = obj as ICharacter;
+                if (ch != null) { jobId = (byte)ch.ClassJob.RowId; jobName = LookupJobName(jobId); }
+                var lp = this.objects.LocalPlayer;
+                isLocal = lp != null && lp.EntityId == entityId;
+            }
+        }
+        catch { }
+
+        var st = new ActorStat { EntityId = entityId, Name = name, JobId = jobId, JobName = jobName, IsLocal = isLocal };
+        lock (this.lockObj)
+        {
+            this.partySet.Add(entityId);
+            if (this.current != null && this.current.Actors != null)
+            {
+                if (!this.current.Actors.ContainsKey(entityId))
+                    this.current.Actors[entityId] = st;
+                else
+                    st = this.current.Actors[entityId];
+            }
+        }
+        return st;
+    }
+
+    private void RefreshParty(bool addOnly)
+    {
+        if (!addOnly)
+            this.partySet.Clear();
+        try
+        {
+            var lp = this.objects.LocalPlayer;
+            if (lp != null) this.partySet.Add(lp.EntityId);
+            if (this.partyList != null)
+            {
+                int n = this.partyList.Length;
+                for (int i = 0; i < n; i++)
+                {
+                    var m = this.partyList[i];
+                    if (m != null && m.EntityId != 0)
+                        this.partySet.Add(m.EntityId);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void PollBuffs()
+    {
+        if (this.current == null || !this.TrackBuffs || this.partyList == null)
+            return;
+        var nowMs = (uint)(DateTime.Now - this.battleStart).TotalMilliseconds;
+        var seen = new HashSet<(uint, uint, uint)>();
+
+        int n = this.partyList.Length;
+        for (int i = 0; i < n; i++)
+        {
+            var m = this.partyList[i];
+            if (m == null) continue;
+            uint affected = m.EntityId;
+            if (affected == 0) continue;
+
+            foreach (var st in m.Statuses)
+            {
+                uint sid = st.StatusId;
+                if (sid == 0) continue;
+                if (!DamageBuffs.RaidBuffStatusIds.Contains(sid)) continue;
+                uint src = st.SourceId;
+                if (src == 0 || src == affected) continue;
+                if (!this.partySet.Contains(src)) continue;
+
+                seen.Add((affected, src, sid));
+                bool already = this.activeBuffs.TryGetValue(affected, out var list) &&
+                               list.Any(b => b.SourceId == src && b.StatusId == sid);
+                if (!already)
+                {
+                    if (!this.activeBuffs.ContainsKey(affected))
+                        this.activeBuffs[affected] = new List<ActiveBuff>();
+                    this.activeBuffs[affected].Add(new ActiveBuff { SourceId = src, StatusId = sid, StartMs = nowMs });
+
+                    string sname = "";
+                    try
+                    {
+                        var row = this.dataManager.GetExcelSheet<Status>()?.GetRow(sid);
+                        if (row != null) sname = row.Value.Name.ToString();
+                    }
+                    catch { }
+                    lock (this.lockObj)
+                    {
+                        this.buffWindows.Add(new BuffWindow
+                        {
+                            ActorEntityId = affected,
+                            SourceEntityId = src,
+                            StatusId = sid,
+                            StatusName = sname,
+                            StartMs = nowMs,
+                            EndMs = nowMs,
+                        });
+                    }
+                }
             }
         }
 
-        if (hasLocalDetail)
+        // 关闭未持续出现的窗口
+        foreach (var kv in this.activeBuffs)
         {
-            this.log.Info($"[Is that a crit？][解码] 首个伤害技能 action={actionId} 首效果: hits={hits} crit={crit} dh={dh} cd={cd}");
+            uint affected = kv.Key;
+            var list = kv.Value;
+            for (int j = list.Count - 1; j >= 0; j--)
+            {
+                var ab = list[j];
+                if (!seen.Contains((affected, ab.SourceId, ab.StatusId)))
+                {
+                    lock (this.lockObj)
+                    {
+                        var w = this.buffWindows.LastOrDefault(b =>
+                            b.ActorEntityId == affected && b.SourceEntityId == ab.SourceId &&
+                            b.StatusId == ab.StatusId && b.EndMs == ab.StartMs);
+                        if (w != null) w.EndMs = nowMs;
+                    }
+                    list.RemoveAt(j);
+                }
+            }
         }
     }
 
@@ -335,20 +622,51 @@ public unsafe class CombatTracker : IDisposable
         s.DamageSum += dmgSum;
         s.DamageCount += dmgCount;
         if (dmgMax > s.DamageMax) s.DamageMax = dmgMax;
-        // 仅在确有伤害取样时更新最小值（初始 uint.MaxValue 不算）。
         if (dmgCount > 0 && dmgMin < s.DamageMin) s.DamageMin = dmgMin;
     }
 
     private double ComputeBattleLuck(BattleRecord rec)
     {
-        long hits = 0, crit = 0, dh = 0, cd = 0;
+        long hits = 0, cd = 0;
         foreach (var s in rec.Skills.Values)
         {
-            hits += s.Hits; crit += s.Crit; dh += s.DirectHit; cd += s.CritDirect;
+            hits += s.Hits; cd += s.CritDirect;
         }
-        double pCrit = rec.CritRatePct / 100.0;
-        double pDh = rec.DhRatePct / 100.0;
-        return LuckRating.ComputeScore(hits, crit, dh, cd, pCrit, pDh);
+        // 以「自我历史基线直暴率」为零假设（v0.4.2 起不再用面板基础概率）。
+        double baseCd = this.GetLuckBaselineCdRate();
+        if (baseCd <= 0)
+        {
+            // 尚无个人历史（首场/无数据）时，回退用面板理论值作降级展示。
+            baseCd = (rec.CritRatePct / 100.0) * (rec.DhRatePct / 100.0);
+        }
+        return LuckRating.ComputeScore(hits, cd, baseCd);
+    }
+
+    /// <summary>
+    /// 个人历史基线直暴率 = 本地玩家在所有已记录战斗中累计的 直暴数 / 命中数。
+    /// 作为「运气」评价的零假设（相对你自己常态偏高=欧、偏低=非酋）。
+    /// grandTotals 只累计本地玩家的技能统计，故天然就是"你自己"的基线。
+    /// 无数据时返回 0（调用方据此回退）。
+    /// </summary>
+    public double GetLuckBaselineCdRate()
+    {
+        lock (this.lockObj)
+        {
+            long hits = 0, cd = 0;
+            foreach (var s in this.grandTotals.Values)
+            {
+                hits += s.Hits;
+                cd += s.CritDirect;
+            }
+            return hits > 0 ? (double)cd / hits : 0;
+        }
+    }
+
+    private sealed class ActiveBuff
+    {
+        public uint SourceId;
+        public uint StatusId;
+        public uint StartMs;
     }
 
     // ---------- 快照 / 查询 ----------
@@ -374,6 +692,14 @@ public unsafe class CombatTracker : IDisposable
                    ?? new List<SkillStat>();
     }
 
+    /// <summary>当前战斗的本队成员快照（按总伤害降序）。</summary>
+    public List<ActorStat> SnapshotCurrentActors()
+    {
+        lock (this.lockObj)
+            return this.current?.Actors?.Values.Select(a => CloneActor(a)).OrderByDescending(a => a.DamageSum).ToList()
+                   ?? new List<ActorStat>();
+    }
+
     public List<BattleRecord> GetHistory()
     {
         lock (this.lockObj)
@@ -386,6 +712,74 @@ public unsafe class CombatTracker : IDisposable
             return this.history.FirstOrDefault(r => r.Id == id);
     }
 
+    /// <summary>当前战斗的只读视图副本（用于团队数据页实时展示）。Timeline 最多复制 maxTimeline 条（取最近）。</summary>
+    public BattleRecord? GetCurrentBattleView(int maxTimeline = 3000)
+    {
+        lock (this.lockObj)
+        {
+            if (this.current == null)
+                return null;
+            List<DamageEvent>? tlCopy = null;
+            var tl = this.current.Timeline;
+            if (tl != null && tl.Count > 0)
+            {
+                int take = Math.Min(tl.Count, maxTimeline);
+                tlCopy = tl.GetRange(tl.Count - take, take);
+            }
+            double dur = (DateTime.Now - this.battleStart).TotalSeconds;
+            return new BattleRecord
+            {
+                Id = this.current.Id,
+                StartedUnix = this.current.StartedUnix,
+                EndedUnix = this.current.EndedUnix,
+                JobId = this.current.JobId,
+                JobName = this.current.JobName,
+                ZoneName = this.current.ZoneName,
+                CritRatePct = this.current.CritRatePct,
+                DhRatePct = this.current.DhRatePct,
+                DurationSec = dur > 0 ? dur : 1,
+                Actors = this.current.Actors?.ToDictionary(kv => kv.Key, kv => CloneActor(kv.Value)),
+                Timeline = tlCopy,
+                Targets = this.current.Targets?.Values.ToDictionary(t => t.TargetEntityId, t => new TargetStat
+                {
+                    TargetEntityId = t.TargetEntityId,
+                    TargetName = t.TargetName,
+                    DamageTaken = t.DamageTaken,
+                    Hits = t.Hits,
+                    MaxHit = t.MaxHit,
+                    ByActor = new Dictionary<uint, ulong>(t.ByActor),
+                }),
+                Buffs = this.current.Buffs?.ToList(),
+                ActionLog = this.current.ActionLog?.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()),
+                BattleLuck = this.current.BattleLuck,
+            };
+        }
+    }
+
+    /// <summary>对当前战斗实时计算近似 rDPS（复用 BattleAnalysis）。无数据返回 null。</summary>
+    public Dictionary<uint, double>? GetCurrentRdps()
+    {
+        lock (this.lockObj)
+        {
+            if (this.current == null || this.current.Actors == null)
+                return null;
+            double dur = (DateTime.Now - this.battleStart).TotalSeconds;
+            if (dur <= 0)
+                return null;
+            try
+            {
+                return BattleAnalysis.ComputeRdps(
+                    this.current.Timeline ?? new List<DamageEvent>(),
+                    this.current.Buffs ?? new List<BuffWindow>(),
+                    this.current.Actors, dur, this.RdpsAttribution);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
     public List<byte> GetTrackedJobIds()
     {
         lock (this.lockObj)
@@ -394,7 +788,6 @@ public unsafe class CombatTracker : IDisposable
 
     public bool IsInBattle => this.current != null;
 
-    /// <summary>运行时调整保留战斗场次上限（立即生效并裁剪历史）。</summary>
     public int MaxBattles
     {
         set
@@ -427,6 +820,12 @@ public unsafe class CombatTracker : IDisposable
         Crit = s.Crit, DirectHit = s.DirectHit, CritDirect = s.CritDirect,
         DamageSum = s.DamageSum, DamageMax = s.DamageMax,
         DamageMin = s.DamageMin, DamageCount = s.DamageCount,
+    };
+
+    private static ActorStat CloneActor(ActorStat a) => new()
+    {
+        EntityId = a.EntityId, Name = a.Name, JobId = a.JobId, JobName = a.JobName, IsLocal = a.IsLocal,
+        Skills = a.Skills.ToDictionary(kv => kv.Key, kv => Clone(kv.Value)),
     };
 
     private string LookupJobName(byte jobId)
@@ -465,7 +864,37 @@ public unsafe class CombatTracker : IDisposable
             {
                 var hist = JsonConvert.DeserializeObject<List<BattleRecord>>(File.ReadAllText(histPath));
                 if (hist != null)
+                {
+                    // 迁移：旧版本（v0.3 及以前）的记录没有 Id 字段，
+                    // 而 v0.4 用 Guid 作为「战斗记录」页的选中键，缺失 Id 会导致 GetBattle 永远返回 null、
+                    // 详情打不开。这里给缺失 Id 的记录补一个，并回存。
+                    bool migrated = false;
+                    foreach (var r in hist)
+                    {
+                        if (string.IsNullOrEmpty(r.Id))
+                        {
+                            r.Id = Guid.NewGuid().ToString("N");
+                            migrated = true;
+                        }
+                        // 兼容旧字段名
+                        if (r.Skills == null)
+                            r.Skills = new Dictionary<uint, SkillStat>();
+                        if (r.Actors == null)
+                            r.Actors = new Dictionary<uint, ActorStat>();
+                        if (r.Timeline == null)
+                            r.Timeline = new List<DamageEvent>();
+                        if (r.Targets == null)
+                            r.Targets = new Dictionary<uint, TargetStat>();
+                        if (r.Buffs == null)
+                            r.Buffs = new List<BuffWindow>();
+                    }
                     this.history = hist;
+                    if (migrated)
+                    {
+                        this.log.Info("[Is that a crit？] 检测到旧版战斗记录，已补充 Id 并回存。");
+                        SaveHistory();
+                    }
+                }
             }
         }
         catch (Exception ex)
