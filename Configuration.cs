@@ -9,9 +9,9 @@ using Dalamud.Configuration;
 public class Configuration : IPluginConfiguration
 {
     /// <summary>配置版本，IPluginConfiguration 要求。</summary>
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
 
-    /// <summary>是否启用伤害技能统计。</summary>
+    /// <summary>是否启用伤害技能统计（含原暴击/运气功能）。</summary>
     public bool EnableTracking { get; set; } = true;
 
     /// <summary>是否只在表格里显示至少造成过一次伤害的技能。</summary>
@@ -25,4 +25,21 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>主窗口是否打开。</summary>
     public bool MainWindowOpen { get; set; } = true;
+
+    // ---------- v0.4 新增：团队数据 / DPS 计量 ----------
+
+    /// <summary>是否采集本队全员（本地玩家 + 同队队员）的 DPS / 时间轴 / BUFF。</summary>
+    public bool EnablePartyMeter { get; set; } = true;
+
+    /// <summary>技能表与技能列表中是否显示技能图标。</summary>
+    public bool ShowSkillIcons { get; set; } = true;
+
+    /// <summary>是否记录并展示 BUFF（团辅/增伤）时间轴。</summary>
+    public bool TrackBuffs { get; set; } = true;
+
+    /// <summary>近似 rDPS 的归因系数（0–1）。1=把受影响者在该 BUFF 期间的全部伤害归因到施放者。</summary>
+    public double RdpsAttribution { get; set; } = 1.0;
+
+    /// <summary>单场战斗记录的时间轴事件上限（防止极端情况内存膨胀）。</summary>
+    public int TimelineMaxEvents { get; set; } = 20000;
 }
